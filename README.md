@@ -16,7 +16,7 @@ rlite input.txt -o output.txt
 ```
 rlite input.txt bigfile.txt somefile.txt 
 ```
-**Remove** all the **common** lines in *verbigfile1.txt* & *somefile.txt* from *input.txt*, assume the *input.txt* is **sorted** with the **-p switch** and write it to stdout
+**Remove** all the **common** lines in *verybigfile1.txt* & *somefile.txt* from *input.txt*, assume the *input.txt* is **sorted** with the **-p switch** and write it to stdout
 ```
 rlite input.txt verybigfile.txt somefile.txt -p
 ```
