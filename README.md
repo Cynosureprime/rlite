@@ -1,37 +1,102 @@
+![rlite logo](/img/rlite.png)
+
 # rlite - lightweight version of rling
 
-A simplistic version of the [rling utility](https://github.com/Cynosureprime/rling), this tool is designed to help users sort, de-duplicate lists against one another.  Compared to **rling**, **rlite** lacks some advanced features, though makes up for it by removing the need for extra dependencies and bringing along with it some speedups. While this is not a replacement, it is an alternative. Depending on the workload there may be some efficiency gains and regressions in others compared to **rling**.
+A simplistic version of [rling](https://github.com/Cynosureprime/rling), this tool is designed to help users sort, de-duplicate lists against one another and perform some simple analytics. Compared to **rling**, **rlite** lacks some advanced features, though makes up for it by removing the need for extra dependencies. While this is not a replacement, it is an alternative. Depending on the workload there may be some efficiency gains and regressions in others compared to **rling**.
 
 ## General information
 
-This tool originally began when it was written in parallel with rling to see who would be able to be faster in de-duplicating lists against one another.  Since then it has undergone many changes to take it to where it is now. **rlite** shares a similar threading framework and also contains some code from **rling**, though you will notice it also handles the threading workloads quite differently. **rlite** was developed to push the envelope of multi-threaded computing and demonstrates this with it's ability push system resources including disk read/write operations, processing cores and also memory usage.
-
+This tool originally began when it was written in parallel with [rling](https://github.com/Cynosureprime/rling) to see who would be able to be faster in de-duplicating lists against one another after @tychotithonus posed the question whether rli could be improved. rlite focuses on providing a well rounded array of tools to sort, de-duplicate, cross de-duplicate, linecount, frequency count and index lists while requiring minimal dependencies. **rlite** shares a similar threading framework and also contains some code from **rling**, though you will notice it also handles the threading workloads differently. **rlite** was developed to push the envelope of multi-threaded computing and demonstrates this with it's ability push system resources including disk read/write operations, processing cores and also memory usage. 
 ## Usage examples
 
-**Sort** and **de-duplicate** the *input.txt* file, write the output to *output.txt*
+**Sort** and **de-duplicate** the *input.txt* file, write the output to *output.txt*. Where possible use -o to allow internal buffer handling to write faster, especially to flash memory.
 ```
 rlite input.txt -o output.txt
+```
+**Sort** and **de-duplicate** the *stdin*, write the output to *stdout*
+```
+rlite stdin
 ```
 **Remove** all the **common** lines in *bigfile1.txt* & *somefile.txt* from *input.txt* and write it to stdout
 ```
 rlite input.txt bigfile.txt somefile.txt 
 ```
-**Remove** all the **common** lines in *verybigfile1.txt* & *somefile.txt* from *input.txt*, assume the *input.txt* is **sorted** with the **-p switch** and write it to stdout
+**Remove** all the **common** lines in *verbigfile1.txt* & *somefile.txt* from *input.txt*, assume the *input.txt* is **sorted** with the **-p switch** and write it to stdout
 ```
-rlite input.txt verybigfile.txt somefile.txt -p
+rlite input.txt verbigfile.txt somefile.txt -p
 ```
 **Keep** the **common** lines from addresses.txt & streets.txt, redirect the stdout to a file
 ```
 rlite input.txt streets.txt addresses.txt -c >> output.txt 
 ```
-## Inspiration
 
-"Key inspiration for this project came from tychotithonus. He suggested the project, and this quickly developed into a "who's smaller?" measuring contest of some kind between Waffle, blazer and hops." [see rling](https://github.com/Cynosureprime/rling)
+## Analysis tools
+rlite input.txt -L
+```
+Reports a linecount and also the longest line
+```
 
-Developed with technologies including yarn threads, roaring bitmaps, qsort_mt and xxhash, Written to be cross-compiled without external library dependencies.  
+rlite input.txt -q
+```
+Counts the frequency of the items inside input.txt and outputs the occurance for each line in TSV format. Items will be ordered in descending popularity order
+```
 
-This could not have been possible without the help of Waffle and hops
+## Advanced examples
+rlite -i input.idx input.txt -b 22
+```
+Create an index file based on input.txt and write this to disk, index is created with 22-bits (default is 40-bits)
+```
+rlite -i input.idx -s bigfile.txt -b 30 -o miss.txt
+```
+Scans a file called bigfile.txt against the index, any hits on the index will be written o miss.txt, uses 30-bits for the idnex in the example
+```
+rlite -i input.idx -s bigfile.txt -b 30 -k
+``` 
+Scans a file called bigfile.txt against the index, any misses on the index will be written to stdout, uses 30-bits for the idnex in the example
+```
+rlite -I input.txt -s bigfile.txt 
+``` 
+Scans a file called bigfile.txt against the index generated by input.txt, the index will not be written to file. It will only be held in memory and discarded when finished. Hits from bigfile.txt against the index generated in memory of input.txt will be written.
+```
+rlite -i input.txt check.txt -l 10
+```
+Matches upto length 10 of the lines inside check.txt. Using this mode, a single line in check.txt can remove multiple lines inside input.txt. This mode is different to the one found in rling.
+```
 
-## Contact
+## Technologies
 
-Created by blazer
+* roaring64 bitmaps / xxhash
+Couples the use of xxhash with the power of roaring64 to generate compact bitmaps to accelerate searching. Thanks @hops
+* multi-threaded indexing, sorting, searching, de-duplicating and writing.
+Uses the yarn library to provide the threading framework to multithread most processes in the pipeline. Thanks @waffle
+* dynamic workload adjustment
+A feedback loop is used from the processing threads back to the thread dispatcher to adjust workload sizes. This asissts in keeping the cores busy rather than idling.
+* Indexed binary searches provide slight improvement over standard binary searches
+* stdin/stdout (partial support for stdin)
+Supports reading the source list from stdin, also has the ability to write the output files to stdout
+* json stats (partial implementation)
+Has the ability to write processing statistics to a json like format. This allows rlite to be silently called by other apps and enables the processing stats to be easily parsed. Thanks @winxp5421
+
+## Notes
+
+* Where possible use -o file to write rather than > file as -o will be faster due to improved buffer handling
+* Where possible specify an input file rather than use stdin and |, as this allows faster reads. Currently not all features supoprt stdin.
+* Please be aware that -l mode which matches upto a length has a different behavior to the one found in rling. The limit is only imposed at the searching phase unlike rling which implements as all stages of matching including de-duplication.
+
+## Q&A
+
+**When should I use the -m flag**
+
+Use use -m when the source list is not that big, but you are running multiple/large reference lists against it
+
+**How come I am seeing low CPU utilization?**
+
+If you are seeing low CPU utilization during the search phase, it could mean you are seeing a disk speed read bottleneck. Rlite can easily saturate the high read speeds of an NVME drive (providing you have the cores).
+
+**Why is it slower/faster than rling**
+
+This tool is not meant to replace the amazing rling, it is merely an alternative which eliminates library dependancy since it does not use mmap and has reduced capability/flexbility. While the tools perform similar functions and share some code, they use a very different implementations. One tool may outperform the other due to hardware specs, list size, mode of operation and operating environment.
+
+## Compile
+```
+make
