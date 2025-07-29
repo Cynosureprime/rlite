@@ -6,20 +6,20 @@
 #define THREAD_MAX 16  // Adjust based on your CPU cores
 
 typedef struct {
-    unsigned long* arr;
+    size_t* arr;
     char** str_arr;
-    unsigned long low;
-    unsigned long high;
+    size_t low;
+    size_t high;
 } SortParams;
 
-void merge(unsigned long arr[], char** str_arr, unsigned long left, unsigned long mid, unsigned long right) {
-    unsigned long i, j, k;
-    unsigned long n1 = mid - left + 1;
-    unsigned long n2 = right - mid;
+void merge(size_t arr[], char** str_arr, size_t left, size_t mid, size_t right) {
+    size_t i, j, k;
+    size_t n1 = mid - left + 1;
+    size_t n2 = right - mid;
 
     // Create temp arrays
-    unsigned long* L = (unsigned long*)malloc(n1 * sizeof(unsigned long));
-    unsigned long* R = (unsigned long*)malloc(n2 * sizeof(unsigned long));
+    size_t* L = (size_t*)malloc(n1 * sizeof(size_t));
+    size_t* R = (size_t*)malloc(n2 * sizeof(size_t));
     char** L_str = (char**)malloc(n1 * sizeof(char*));
     char** R_str = (char**)malloc(n2 * sizeof(char*));
 
@@ -73,13 +73,13 @@ void merge(unsigned long arr[], char** str_arr, unsigned long left, unsigned lon
 
 void* parallel_mergesort(void* arg) {
     SortParams* params = (SortParams*)arg;
-    unsigned long low = params->low;
-    unsigned long high = params->high;
-    unsigned long* arr = params->arr;
+    size_t low = params->low;
+    size_t high = params->high;
+    size_t* arr = params->arr;
     char** str_arr = params->str_arr;
 
     if (low < high) {
-        unsigned long mid = low + (high - low) / 2;
+        size_t mid = low + (high - low) / 2;
 
         // Create thread parameters for left and right halves
         SortParams left_params = {arr, str_arr, low, mid};
@@ -103,7 +103,7 @@ void* parallel_mergesort(void* arg) {
     return NULL;
 }
 
-void sort_arrays(unsigned long arr[], char** str_arr, unsigned long n) {
+void sort_arrays(size_t arr[], char** str_arr, unsigned long n) {
     SortParams params = {arr, str_arr, 0, n - 1};
     parallel_mergesort(&params);
 }
