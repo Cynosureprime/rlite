@@ -39,7 +39,7 @@
 pthread_mutex_t pointerMapMutexes[NUM_SEGMENTS];
 
 #define WriteBufferSize 10240000
-#define version "0.31-3320dbba7c"
+#define version "0.33-x"
 
 roaring64_bitmap_t *SearchMap[17];
 roaring64_bitmap_t *FinalMap;
@@ -57,13 +57,14 @@ char strings[BUFSIZ];
 char* DelimitChar;
 char pretty[64];
 char pretty2[64];
-unsigned long * occuranceCounter;
+size_t * occuranceCounter;
 #define TAG_MASK 0x8000000000000000ULL
 #define MAX_READ 0xFFFFFFFFFFFFFFFF
 ErrorStats error;
 int indxmode = 0;
 uint64_t mask_bits = (1ULL << 40) - 1;
 size_t Progress_Reads = 0;
+long count_limit = 0;
 //mode 0:build, 1:use, 2:add
 
 roaring64_bitmap_t* merge_bitmaps_inplace(roaring64_bitmap_t** bitmaps, size_t count) {
@@ -584,7 +585,7 @@ typedef struct indexnode
     file_struct *node_filestruct;
     bool mFlag;
     bool qFlag;
-    unsigned long * countedArr;
+    size_t * countedArr;
 
     size_t id;
 
@@ -644,7 +645,7 @@ void buffer_string2(WBuffer *WStruct, char *string,size_t max)
 }
 
 //Write string with counts
-void buffer_string3(unsigned long * arr, size_t iLoopIdx, WBuffer *WStruct, char *string,size_t max)
+void buffer_string3(size_t * arr, size_t iLoopIdx, WBuffer *WStruct, char *string,size_t max)
 {
     size_t len = mystrlen2(string,max); //Since our buffer is always delimieted with 0xA we can make this unsafe call
 
@@ -682,19 +683,31 @@ void buffer_string3(unsigned long * arr, size_t iLoopIdx, WBuffer *WStruct, char
         }
 
         //atoi is not standard use snprintf (max 4B u32, but provision len 12)
-        char str[12];
-        snprintf(str, sizeof(str), "%lu", arr[iLoopIdx]);
+        if (count_limit == 0)
+        {
+            char str[12];
+            snprintf(str, sizeof(str), "%zu", arr[iLoopIdx]);
+            memcpy(WStruct->buffer + WStruct->bufferUsed,str,strlen(str));
+            WStruct->buffer[WStruct->bufferUsed+strlen(str)] =9;
+            WStruct->bufferUsed +=(strlen(str) +1);
 
-        memcpy(WStruct->buffer + WStruct->bufferUsed,str,strlen(str));
-        WStruct->buffer[WStruct->bufferUsed+strlen(str)] =9;
+            memcpy(WStruct->buffer + WStruct->bufferUsed, string, len);
+            WStruct->buffer[len + WStruct->bufferUsed] = 10;
+            WStruct->bufferUsed += (len + 1);
+            WStruct->writeCount++;
+        }
+        else
+        {
+            if (arr[iLoopIdx] >= count_limit)
+            {
+                memcpy(WStruct->buffer + WStruct->bufferUsed, string, len);
+                WStruct->buffer[len + WStruct->bufferUsed] = 10;
+                WStruct->bufferUsed += (len + 1);
+                WStruct->writeCount++;
+            }
+        }
 
-        WStruct->bufferUsed +=(strlen(str) +1);
 
-        memcpy(WStruct->buffer + WStruct->bufferUsed, string, len);
-
-        WStruct->buffer[len + WStruct->bufferUsed] = 10;
-        WStruct->bufferUsed += (len + 1);
-        WStruct->writeCount++;
 
 }
 JOBIndex *indexjobs;
@@ -1188,7 +1201,7 @@ void thread_search(void * dummy)
 
         switch (job->mode)
         {
-         puts("search");
+
         case 0: // Search mode
             clock_gettime(CLOCK_REALTIME, &thread_start);
             IndexFile(&job->node_refstruct);
@@ -1521,7 +1534,9 @@ if (argc == 1) {
         "\t-r [dir]      Read and recurse a directory (not implemented)\n"
         "\t-L, --count   Line Count with longest count\n"
         "\t-q            Occurance analysis outputs as TSV format\n"
-        "\t-j, --json    Output stats as json\n\n"
+        "\t-C [count]    Limit output to min count occurrance (outputs 1 instance)\n"
+        "\t-j, --json    Output stats as json\n"
+        "V-j, --version  Output version information\n\n"
         "Indexing modes:\n"
         "\t-i [file]     Index to file to disk\n"
         "\t-I            Index to file memory\n"
@@ -1536,6 +1551,7 @@ if (argc == 1) {
 
     char *ivalue = NULL, *idxvalue = NULL, *bitsValue = NULL, *tvalue = NULL, *ovalue = NULL, *rvalue = NULL, *Dvalue = NULL;
     int mFlag = 0, nFlag = 0,cFlag = 0, pFlag = 0, LFlag = 0, qFlag = 0, jFlag = 0, sFlag = 0, kFlag = 0, IFlag = 0;
+    long limit = 0;
 
     int c;
     JOB *job;
@@ -1547,6 +1563,7 @@ if (argc == 1) {
         static struct option long_options[] =
             {
                 {"output", no_argument, 0, 'o'},
+                {"version", no_argument, 0, 'V'},
                 {"threads", required_argument, 0, 't'},
                 {"nonorder", no_argument, 0, 'n'},
                 {"count", no_argument, 0, 'L'},
@@ -1556,7 +1573,7 @@ if (argc == 1) {
                 {0, 0, 0, 0}};
         int option_index = 0;
 
-        c = getopt_long(argc, argv, "rnmhcpqsLjkIt:o:l:D:i:b:",
+        c = getopt_long(argc, argv, "VrnmhcpqsLjkIt:o:l:D:i:b:C:",
                         long_options, &option_index);
 
         if (c == -1)
@@ -1572,6 +1589,9 @@ if (argc == 1) {
                 printf(" with arg %s", optarg);
             printf("\n");
             break;
+        case 'V':
+            printf("%s\n\n",version);
+            return(0);
         case 'I':
             IFlag = true;
             indxmode = 3;
@@ -1603,6 +1623,10 @@ if (argc == 1) {
             break;
         case 's':
             sFlag = true;
+            break;
+        case 'C':
+            count_limit = atoi(optarg);
+            qFlag = true;
             break;
         case 'k':
             kFlag = true;
@@ -1690,9 +1714,9 @@ if (argc == 1) {
         return -1;
     }
 
-    if (IFlag != NULL)
+    if (IFlag != 0)
     {
-        if (sFlag == NULL)
+        if (sFlag == 0)
         {
             fprintf(stderr, "I mode requires argument -s specified\n");
             exit(1);
@@ -1744,7 +1768,10 @@ if (argc == 1) {
             {
                 if (qFlag)
                 {
-                    if (!jFlag) fprintf(stderr, "Occurance analysis\n");
+                    if (count_limit == 0)
+                        if (!jFlag) fprintf(stderr, "Occurance analysis\n");
+                    else
+                        if (!jFlag) fprintf(stderr, "Output occurance limit to %ld\n",count_limit);
                 }
                 else{
                     if (!jFlag) fprintf(stderr, "No valid reference files specified, running in sort mode\n");
@@ -1777,7 +1804,7 @@ if (argc == 1) {
          fprintf(stderr, "Index mode (memory)\n");
     }
 
-    if (sFlag != NULL)
+    if (sFlag != 0)
     {
         if (kFlag ==0)
             fprintf(stderr, "Writing matches on index\n");
@@ -1807,7 +1834,7 @@ if (argc == 1) {
             }
             idx = fopen(idxvalue, "rb");
             char* buffer = (char*)malloc(file_size);
-            if (buffer == NULL) return NULL;
+            if (buffer == NULL) return 0;
             size_t read_size = fread(buffer, 1, file_size, idx);
             if (read_size != file_size) {
                 free(buffer);
@@ -1859,7 +1886,7 @@ if (argc == 1) {
             idx = fopen(idxvalue, "rb");
             size_t file_size = FileSize(idxvalue);
             char* buffer = (char*)malloc(file_size);
-            if (buffer == NULL) return NULL;
+            if (buffer == NULL) return 0;
             size_t read_size = fread(buffer, 1, file_size, idx);
             if (read_size != file_size) {
                 free(buffer);
@@ -2383,7 +2410,7 @@ ReRun:
 
     if (mFlag == true)
     {
-        FinalMap = merge_bitmaps_inplace(&SearchMap,16);
+        FinalMap = merge_bitmaps_inplace(SearchMap,16);
         size_t occupancy = roaring64_bitmap_get_cardinality(FinalMap);
         sizeUsage(roaring64_bitmap_portable_size_in_bytes(FinalMap));
         size_t_to_pretty(occupancy, pretty, sizeof(pretty));
@@ -2433,7 +2460,7 @@ ReRun:
         {
             sizeUsage((input.itemTotal*8));
             fprintf(stderr, "Allocating additional memory (~%s)\n", strings);
-            occuranceCounter = (unsigned long*) calloc(input.itemTotal,sizeof(unsigned long));
+            occuranceCounter = (size_t*) calloc(input.itemTotal,sizeof(size_t));
             if (occuranceCounter == NULL)
             {
                 fprintf(stderr,"Unable to allocate memory");
@@ -2442,7 +2469,10 @@ ReRun:
 
         if (qFlag)
         {
-            if (!jFlag) fprintf(stderr, "Analysis beginning\n");
+            if (count_limit == 0)
+                if (!jFlag) fprintf(stderr, "Analysis beginning\n");
+            else
+                if (!jFlag) fprintf(stderr, "Occurance limit starting\n");
         }
         else
         {
@@ -2553,7 +2583,12 @@ ReRun:
 
 
         if (qFlag)
-            sort_arrays(occuranceCounter, fullPointerMap, actualEnd);
+        {
+            //heap_sort(occuranceCounter, fullPointerMap, actualEnd,1);
+            sort_arrays(occuranceCounter, fullPointerMap, actualEnd,threads_count);
+            fprintf(stderr,"Finished\n");
+        }
+
 
         if (jFlag){
             stats.timings.deduplicating.deduplication_seconds = time_elapsed(&clock_running,1);
@@ -2561,6 +2596,10 @@ ReRun:
             stats.timings.deduplicating.unique_lines =actualEnd;
         }
         else{
+            if (input.itemTotal < actualEnd)
+            {
+                input.itemTotal = actualEnd;
+            }
             size_t_to_pretty(input.itemTotal - actualEnd, pretty, sizeof(pretty));
             size_t_to_pretty(actualEnd, pretty2, sizeof(pretty2));
             fprintf(stderr, "%s unique (%s duplicate lines)", pretty2,pretty);
