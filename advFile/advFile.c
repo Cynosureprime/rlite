@@ -14,16 +14,26 @@
 #include <stdint.h>
 //#define chunksize 4251200
 #define _FILE_OFFSET_BITS 64
-#define _LARGEFILE64_SOURCE
+
 #include "advFile.h"
 size_t chunksize = 1048576;
 
-void adjustChunk(int direction)
+void setChunksize(size_t newSize)
+{
+    chunksize = newSize;
+}
+
+void resetChunksize()
+{
+    chunksize = 1048576;
+}
+
+void adjustChunk(file_struct *file,int direction)
 {
     if (direction > 0)
-        chunksize = chunksize *(2*direction);
+        file->chunkSize = file->chunkSize *(2*direction);
     else if (direction < 0)
-        chunksize = chunksize /(2*abs(direction));
+        file->chunkSize = file->chunkSize /(2*abs(direction));
 }
 
 size_t count_line_endings_sse_single(const char* buffer, size_t length) {
@@ -425,6 +435,7 @@ int OpenFile02(file_struct *file)
     file->readsize = 0;
     file->readNo = 0;
     file->extensions = 0;
+    file->chunkSize = chunksize;
 #ifdef _WIN
     setmode(0, O_BINARY);
 #endif
@@ -838,12 +849,12 @@ void ReadFile02(file_struct *file)
 
     if (file->readsize == 0)
     {
-        file->readsize = chunksize;
+        file->readsize = file->chunkSize;
     }
 
     if (longread == 0)
     {
-        file->readsize = chunksize;
+        file->readsize = file->chunkSize;
     }
 
 ReRead:
@@ -992,9 +1003,9 @@ void ReadFileAll(file_struct *file)
 
     while (file->f_rem != 0)
     {
-        if (file->f_rem > chunksize)
+        if (file->f_rem > file->chunkSize)
         {
-            adjustedSize = chunksize;
+            adjustedSize = file->chunkSize;
         }
         else
         {
