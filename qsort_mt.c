@@ -178,7 +178,8 @@ struct qsort {
 	pthread_t id;		/* Thread id. */
 	pthread_mutex_t mtx_st;	/* For signalling state change. */
 	pthread_cond_t cond_st;	/* For signalling state change. */
-};
+	char padding[64];
+}__attribute__((aligned(64)));
 
 /* Invariant common part, shared across invocations. */
 struct common {
@@ -354,7 +355,7 @@ top:
 
 	/* From here on qsort(3) business as usual. */
 	swap_cnt = 0;
-	if (n < 7) {
+	if (n < 16) {
 		for (pm = (char *)a + es; pm < (char *)a + n * es; pm += es)
 			for (pl = pm;
 			     pl > (char *)a && CMP(thunk, pl - es, pl) > 0;
@@ -395,7 +396,7 @@ top:
 			}
 			pc -= es;
 		}
-		if (pb > pc)
+		if (__builtin_expect(pb > pc,0))
 			break;
 		swap(pb, pc);
 		swap_cnt = 1;
