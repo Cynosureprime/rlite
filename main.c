@@ -81,7 +81,7 @@ static size_t pf_queue_size = 0;
 static pthread_mutex_t pf_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  pf_queue_cond  = PTHREAD_COND_INITIALIZER;
 
-#define version "0.38"
+#define version "0.42"
 int mylstrcmp(const char *a, const char *b);
 
 roaring64_bitmap_t *SearchMap[16];
