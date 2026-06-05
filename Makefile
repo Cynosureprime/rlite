@@ -37,6 +37,8 @@ SRC = main.c \
 	advFile/fhandle.c \
 	threading/yarn.c \
 	qsort_mt.c \
+	strings.c \
+	cluster.c \
 	roaring.c \
 	msort.c
 # Header files

@@ -335,10 +335,8 @@ qsort_algo(struct qsort *qs)
 	long long int nl, nr;
 	struct common *c;
 	struct qsort *qs2;
-	pthread_t id;
 
 	/* Initialize qsort arguments. */
-	id = qs->id;
 	c = qs->common;
 	es = c->es;
 	cmp = c->cmp;
@@ -461,10 +459,9 @@ qsort_thread(void *p)
 	struct qsort *qs, *qs2;
 	int i;
 	struct common *c;
-	pthread_t id;
+
 
 	qs = p;
-	id = qs->id;
 	c = qs->common;
 again:
 	/* Wait for work to be allocated. */

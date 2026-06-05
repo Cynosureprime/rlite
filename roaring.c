@@ -11013,7 +11013,7 @@ namespace roaring {
 namespace internal {
 #endif
 
-extern inline void bitset_print(const bitset_t *b);
+
 extern inline bool bitset_for_each(const bitset_t *b, bitset_iterator iterator,
                                    void *ptr);
 extern inline size_t bitset_next_set_bits(const bitset_t *bitset,

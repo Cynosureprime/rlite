@@ -1,10 +1,18 @@
+#define CACHE_LINE_SIZE 64
+#define COUNTER_STRIDE (CACHE_LINE_SIZE / sizeof(size_t))
+
+#ifdef __MINGW32__
+#define ffs __builtin_ffs
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 #include <fcntl.h>
-
+#include <libgen.h>
+#include <inttypes.h>
 
 #include <getopt.h>
 #include <time.h>
@@ -27,21 +35,56 @@
 #include "threading/getinfo.c"
 #include "advFile/advFile.h"
 #include "advFile/fhandle.h"
+#include "cluster.h"
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include "roaring.h"
 
+#include "strings.h"
 
 #define NUM_SEGMENTS 4096
 
 #include <pthread.h>
-pthread_mutex_t pointerMapMutexes[NUM_SEGMENTS];
 
-#define WriteBufferSize 10240000
-#define version "0.33-x"
+typedef struct {
+    pthread_mutex_t mutex;
+    char padding[CACHE_LINE_SIZE - sizeof(pthread_mutex_t)];
+} __attribute__((aligned(CACHE_LINE_SIZE))) CacheAlignedMutex;
+CacheAlignedMutex pointerMapMutexes[NUM_SEGMENTS];
 
-roaring64_bitmap_t *SearchMap[17];
+
+typedef struct {
+    char *buffer;
+    size_t buffer_size;
+    char **pointerMap;
+    size_t itemCount;
+    size_t pointerMap_size;
+    uintptr_t endAddress;
+    int ready;
+    int eof;
+    size_t next_f_rem;
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+} PrefetchBuffer;
+
+typedef struct {
+    file_struct *handler;
+    PrefetchBuffer *pb;
+} PrefetchRequest;
+
+
+static PrefetchBuffer *pfbufs = NULL;
+static PrefetchRequest *pf_queue = NULL;
+static int pf_head = 0, pf_tail = 0, pf_stop = 0;
+static size_t pf_queue_size = 0;
+static pthread_mutex_t pf_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  pf_queue_cond  = PTHREAD_COND_INITIALIZER;
+
+#define version "0.38"
+int mylstrcmp(const char *a, const char *b);
+
+roaring64_bitmap_t *SearchMap[16];
 roaring64_bitmap_t *FinalMap;
 
 size_t binary_index_start[256] = {0};
@@ -64,9 +107,161 @@ ErrorStats error;
 int indxmode = 0;
 uint64_t mask_bits = (1ULL << 40) - 1;
 size_t Progress_Reads = 0;
-long count_limit = 0;
+size_t count_limit = 0;
 //mode 0:build, 1:use, 2:add
 
+// Double Buffering Globals
+typedef struct {
+    char *buffer;
+    size_t buffer_size;
+    char **pointerMap;
+    size_t itemCount;
+    uintptr_t endAddress;
+    int eof;
+} ReadBuffer;
+
+// Interleaved buffer
+ReadBuffer read_buffers[1];
+
+// Synchronization
+pthread_mutex_t read_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  read_cond_producer = PTHREAD_COND_INITIALIZER;
+pthread_cond_t  read_cond_consumer = PTHREAD_COND_INITIALIZER;
+
+int read_buf_ready[1] = {0}; // Flags: 0=empty, 1=ready
+int read_buf_idx = 0;           // Current buffer being filled/read
+int read_eof_flag = 0;          // Global EOF flag
+
+// Prefetched interleaved buffer, at most we have 2 open buffers
+void *prefetch_reader_thread(void *arg) {
+    file_struct *input = (file_struct *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&read_mutex);
+        while (read_buf_ready[0]) {
+            pthread_cond_wait(&read_cond_producer, &read_mutex);
+        }
+
+        if (input->f_rem == 0) {
+            read_eof_flag = 1;
+            pthread_cond_signal(&read_cond_consumer);
+            pthread_mutex_unlock(&read_mutex);
+            break;
+        }
+
+        file_struct tmp = *input;
+        tmp.buffer = NULL; tmp.buffer_size = 0;
+        tmp.pointerMap = NULL; tmp.pointerMap_size = 0;
+
+        pthread_mutex_unlock(&read_mutex);
+        ReadFile02(&tmp);
+        IndexFile(&tmp);
+
+        pthread_mutex_lock(&read_mutex);
+        read_buffers[0].buffer = tmp.buffer;
+        read_buffers[0].buffer_size = tmp.buffer_size;
+        read_buffers[0].pointerMap = tmp.pointerMap;
+        read_buffers[0].itemCount = tmp.itemCount;
+        read_buffers[0].endAddress = tmp.endAddress;
+
+        input->bytesRead = tmp.bytesRead;
+        input->f_rem = tmp.f_rem;
+        input->extensions = tmp.extensions;
+
+        read_buf_ready[0] = 1;
+        pthread_cond_signal(&read_cond_consumer);
+        pthread_mutex_unlock(&read_mutex);
+    }
+    return NULL;
+}
+
+void *prefetch_thread(void *arg) {
+    while (1) {
+        pthread_mutex_lock(&pf_queue_mutex);
+        while (pf_head == pf_tail && !pf_stop)
+            pthread_cond_wait(&pf_queue_cond, &pf_queue_mutex);
+        if (pf_stop && pf_head == pf_tail) {
+            pthread_mutex_unlock(&pf_queue_mutex);
+            break;
+        }
+        PrefetchRequest req = pf_queue[pf_head % pf_queue_size];
+        pf_head++;
+        pthread_mutex_unlock(&pf_queue_mutex);
+
+        file_struct tmp = *req.handler;
+        tmp.buffer = NULL; tmp.buffer_size = 0;
+        tmp.pointerMap = NULL; tmp.pointerMap_size = 0;
+        ReadFile02(&tmp);
+        IndexFile(&tmp);
+        req.handler->bytesRead = tmp.bytesRead;
+        //req.handler->f_rem     = tmp.f_rem;
+
+        pthread_mutex_lock(&req.pb->mutex);
+        req.pb->next_f_rem  = tmp.f_rem;
+        req.pb->eof         = (tmp.f_rem == 0);
+        req.pb->buffer      = tmp.buffer;
+        req.pb->buffer_size = tmp.buffer_size;
+        req.pb->pointerMap  = tmp.pointerMap;
+        req.pb->itemCount   = tmp.itemCount;
+        req.pb->endAddress  = tmp.endAddress;
+        req.pb->ready       = 1;
+        pthread_cond_signal(&req.pb->cond);
+        pthread_mutex_unlock(&req.pb->mutex);
+    }
+    return NULL;
+}
+
+static inline void adjust_loser_tree(int *tree, int idx, int k, file_struct *handlers, size_t *read_indices) {
+    int parent = (idx + k) / 2;
+    while (parent > 0) {
+        int opponent = tree[parent];
+
+        if (opponent == -1) {
+            tree[parent] = idx;
+            return;
+        }
+
+        // Check if either handler is fully exhausted
+        bool idx_exhausted = (handlers[idx].f_rem == 0 && read_indices[idx] >= handlers[idx].itemCount);
+        bool opp_exhausted = (handlers[opponent].f_rem == 0 && read_indices[opponent] >= handlers[opponent].itemCount);
+
+        int winner, loser;
+
+        if (idx_exhausted && opp_exhausted) {
+            winner = idx; loser = opponent;
+        } else if (idx_exhausted) {
+            winner = opponent; loser = idx;
+        } else if (opp_exhausted) {
+            winner = idx; loser = opponent;
+        } else {
+            // Both have data - safe to compare
+            char *str_idx = handlers[idx].pointerMap[read_indices[idx]];
+            char *str_opp = handlers[opponent].pointerMap[read_indices[opponent]];
+
+            if (mystrcmp(str_idx, str_opp) <= 0) {
+                winner = idx; loser = opponent;
+            } else {
+                winner = opponent; loser = idx;
+            }
+        }
+
+        tree[parent] = loser;
+        idx = winner;
+        parent /= 2;
+    }
+    tree[0] = idx;
+}
+
+static inline void build_loser_tree(int *tree, int k, file_struct *handlers, size_t *read_indices) {
+    // Initialize leaves with their own indices
+for (int i = 0; i < k; i++) {
+        tree[i] = -1;
+    }
+    // Build tree by adjusting each leaf
+    for (int i = 0; i < k; i++) {
+        adjust_loser_tree(tree, i, k, handlers, read_indices);
+    }
+}
 roaring64_bitmap_t* merge_bitmaps_inplace(roaring64_bitmap_t** bitmaps, size_t count) {
     if (count == 0) return NULL;
     if (count == 1) return roaring64_bitmap_copy(bitmaps[0]);
@@ -255,6 +450,22 @@ long long int BinarySearchOG(char *key, char *stringArray[], long long int lo, l
     return -1;
 }
 
+int comp2(const void *a, const void *b) {
+    char *a1 = (char *)a;
+
+    char * ptr = b;
+
+    if (isTagged(ptr))
+        ptr = untagPointer(ptr);
+
+    return(mylstrcmp(a1,ptr));
+}
+
+int comp_cluster(const void *s1, const void *s2)
+{
+    return cluster_hash_cmp(*(const char **)s1, *(const char **)s2);
+}
+
 long long int BinarySearchLen(char *key, char *stringArray[], long long int lo, long long int hi)
 {
     long long int mid;
@@ -369,16 +580,7 @@ int myldstrcmp(const char *a, const char *b) {
   }
 }
 
-int comp2(const void *a, const void *b) {
-    char *a1 = (char *)a;
 
-    char * ptr = b;
-
-    if (isTagged(ptr))
-        ptr = untagPointer(ptr);
-
-    return(mylstrcmp(a1,ptr));
-}
 
 float time_elapsed(struct timespec * clock,bool restart_clock)
 {
@@ -393,84 +595,6 @@ float time_elapsed(struct timespec * clock,bool restart_clock)
     return elapsed_time;
 }
 
-// not as fancy as rling vectorization code used for debugging
-size_t mystrlen(char *line)
-{
-    char *ret = strchr(line, 0xA);
-    if (ret != NULL)
-    {
-        return ret - line;
-    }
-    else
-    {
-        for(int i =0; i<100;i++)
-        {
-            fprintf(stderr,"%c\t %d\n",line[i],(int)line[i]);
-        }
-        fprintf(stderr, "Error getting line length\n");
-        exit(1);
-    }
-}
-
-
-// not as fancy as rling vectorization code, but this works
-size_t mystrlen2(char *line,size_t bytes)
-{
-    char *ret = memchr(line, 0xA,bytes);
-    if (ret != NULL)
-    {
-        size_t len = ret -line;
-        if ((ret -line) > 0)
-        {
-            if ((unsigned char)line[len-1] == 0xD)
-            {
-                return (len-1);
-            }
-        }
-        return len;
-    }
-    else
-    {
-
-        fprintf(stderr, "Error getting line length %zu \n",bytes);
-        exit(1);
-    }
-}
-
-//Gets a stringth length, requires the starter pointer and also max address (for debugging)
-size_t mystrlen3(char *line,size_t bytes,size_t one, size_t two)
-{
-
-    char *ret = memchr(line, 0xA,bytes);
-    if (ret != NULL)
-    {
-        size_t len = ret -line;
-        if ((ret -line) > 0)
-        {
-            if ((unsigned char)line[len-1] == 0xD)
-            {
-                return (len-1);
-            }
-        }
-        return len;
-    }
-    else
-    {
-        fprintf(stderr, "Error getting line length %zu %zu %zu\n",bytes,one, two);
-        exit(1);
-    }
-    return 0;
-}
-
-//Used for debugging
-void myputs(char *line)
-{
-    char buffer[BUFSIZ];
-    fprintf(stderr,"string length is %zu\n",mystrlen2(line,100000000));
-    memcpy(buffer,line,mystrlen2(line,100000000));
-    buffer[mystrlen(line)] = 0;
-    fprintf(stderr,"%s\n",buffer);
-}
 
 char* size_t_to_pretty(size_t num, char* buffer, size_t buffer_size) {
     char temp[64];
@@ -479,6 +603,12 @@ char* size_t_to_pretty(size_t num, char* buffer, size_t buffer_size) {
     // Convert number to string
     snprintf(temp, sizeof(temp), "%zu", num);
     len = strlen(temp);
+
+    // Buffer overflow check
+    size_t required = len + (len - 1) / 3;
+    if (required + 1 > buffer_size) {
+        return NULL;
+    }
 
     // Start from the end of the string
     i = len - 1;
@@ -511,26 +641,12 @@ char* size_t_to_pretty(size_t num, char* buffer, size_t buffer_size) {
 }
 
 
-//Used for debugging
-size_t myputs2(char *line,size_t bytes)
-{
-    char buffer[BUFSIZ];
-    fprintf(stderr,"string length is %zu\n",mystrlen2(line,100000000));
-
-    memcpy(buffer,line,mystrlen2(line,bytes));
-    buffer[mystrlen2(line,bytes)] = 0;
-    for (size_t i =0; i<=mystrlen2(line,bytes); i++)
-    {
-        fprintf(stderr,"%d\t",buffer[i]);
-    }
-    fprintf(stderr,"%s\n",buffer);
-}
 
 //Used for locking pointermap during inner tagging, will re-aquire new lock when needed
 long long int mutex_relock(long long int currIdx, long long int nextIdx)
 {
-    pthread_mutex_unlock(&pointerMapMutexes[currIdx]);
-    pthread_mutex_lock(&pointerMapMutexes[nextIdx]);
+    pthread_mutex_unlock(&pointerMapMutexes[currIdx].mutex);
+    pthread_mutex_lock(&pointerMapMutexes[nextIdx].mutex);
 
     return nextIdx;
 }
@@ -544,7 +660,6 @@ typedef struct worknode
     char **pointerMap;
     char *buffer;
     size_t buffer_size;
-
 
     bool mFlag;
     bool cFlag;
@@ -563,7 +678,7 @@ typedef struct worknode
     double time;
     bool qFlag;
     bool keep;
-} JOB;
+} __attribute__((aligned(64))) JOB; // 64-byte alignment to improve cache access
 
 typedef struct indexnode
 {
@@ -589,129 +704,13 @@ typedef struct indexnode
 
     size_t id;
 
-} JOBIndex;
-
-typedef struct writeBuffer
-{
-    size_t bufferSize;
-    size_t bufferUsed;
-    char *buffer;
-    size_t writeCount;
-} WBuffer;
-
-void buffer_string2(WBuffer *WStruct, char *string,size_t max)
-{
-    size_t len = mystrlen2(string,max); //Since our buffer is always delimieted with 0xA we can make this unsafe call
-
-        if (len >= (WStruct->bufferSize - WStruct->bufferUsed))
-        {
-            // We need to increase the buffer larger than the default size fo accomodate the len
-            if (len > WriteBufferSize)
-            {
-                WStruct->buffer = (char *)realloc(WStruct->buffer, WStruct->bufferSize + (len * 2) + 1);
-                if (WStruct->buffer == NULL)
-                {
-
-                    fprintf(stderr, "Unable to realloc buffer for writing exiting");
-                    exit(1);
-                }
-                else
-                {
-                    fprintf(stderr, "Increasing write buffer\n");
-                    WStruct->bufferSize += (len * 2);
-                }
-            }
-            else
-            {
-                WStruct->buffer = (char *)realloc(WStruct->buffer, WStruct->bufferSize + WriteBufferSize + 1);
-                if (WStruct->buffer == NULL)
-                {
-                    fprintf(stderr, "Unable to realloc buffer for writing exiting");
-                    exit(1);
-                }
-                else
-                {
-                    WStruct->bufferSize += (WriteBufferSize);
-                }
-            }
-        }
-
-        memcpy(WStruct->buffer + WStruct->bufferUsed, string, len);
-
-        WStruct->buffer[len + WStruct->bufferUsed] = 10;
-        WStruct->bufferUsed += (len + 1);
-        WStruct->writeCount++;
-
-}
-
-//Write string with counts
-void buffer_string3(size_t * arr, size_t iLoopIdx, WBuffer *WStruct, char *string,size_t max)
-{
-    size_t len = mystrlen2(string,max); //Since our buffer is always delimieted with 0xA we can make this unsafe call
-
-
-        if ((len + 12)>= (WStruct->bufferSize - WStruct->bufferUsed))
-        {
-            // We need to increase the buffer larger than the default size fo accomodate the len
-            if (len > WriteBufferSize)
-            {
-                WStruct->buffer = (char *)realloc(WStruct->buffer, WStruct->bufferSize + (len * 2) + 1);
-                if (WStruct->buffer == NULL)
-                {
-                    fprintf(stderr, "Unable to realloc buffer for writing exiting");
-                    exit(1);
-                }
-                else
-                {
-                    fprintf(stderr, "Increasing write buffer\n");
-                    WStruct->bufferSize += (len * 2);
-                }
-            }
-            else
-            {
-                WStruct->buffer = (char *)realloc(WStruct->buffer, WStruct->bufferSize + WriteBufferSize + 1);
-                if (WStruct->buffer == NULL)
-                {
-                    fprintf(stderr, "Unable to realloc buffer for writing, exiting");
-                    exit(1);
-                }
-                else
-                {
-                    WStruct->bufferSize += (WriteBufferSize);
-                }
-            }
-        }
-
-        //atoi is not standard use snprintf (max 4B u32, but provision len 12)
-        if (count_limit == 0)
-        {
-            char str[12];
-            snprintf(str, sizeof(str), "%zu", arr[iLoopIdx]);
-            memcpy(WStruct->buffer + WStruct->bufferUsed,str,strlen(str));
-            WStruct->buffer[WStruct->bufferUsed+strlen(str)] =9;
-            WStruct->bufferUsed +=(strlen(str) +1);
-
-            memcpy(WStruct->buffer + WStruct->bufferUsed, string, len);
-            WStruct->buffer[len + WStruct->bufferUsed] = 10;
-            WStruct->bufferUsed += (len + 1);
-            WStruct->writeCount++;
-        }
-        else
-        {
-            if (arr[iLoopIdx] >= count_limit)
-            {
-                memcpy(WStruct->buffer + WStruct->bufferUsed, string, len);
-                WStruct->buffer[len + WStruct->bufferUsed] = 10;
-                WStruct->bufferUsed += (len + 1);
-                WStruct->writeCount++;
-            }
-        }
+} __attribute__((aligned(64)))JOBIndex;
 
 
 
-}
+
 JOBIndex *indexjobs;
-JOB *jobs;
+JOB *jobs = NULL;
 
 size_t read_id = 0;
 
@@ -732,7 +731,8 @@ void buildFree(int WUs)
     int i = 0;
     JOB *job;
 
-    FreeTail = NULL;
+    FreeHead = NULL;
+    FreeTail = &FreeHead;
     if (jobs == NULL)
     {
         return;
@@ -760,8 +760,8 @@ void buildIndexFree(int WUs)
 {
     int i = 0;
     JOBIndex *job;
-
-    IndexFreeTail = NULL;
+    IndexFreeHead = NULL;
+    IndexFreeTail = &IndexFreeHead;
     if (indexjobs == NULL)
     {
         return;
@@ -1016,18 +1016,9 @@ void thread_index(void * dummy)
 
             if (job->write_dupe)
             {
-                Write_Buffer.bufferSize = WriteBufferSize + 1;
-                Write_Buffer.bufferUsed = 0;
-                Write_Buffer.writeCount = 0;
+                initWriteBuffer(&Write_Buffer);
 
-                Write_Buffer.buffer = (char *)malloc(WriteBufferSize + 1);
-                if (Write_Buffer.buffer ==NULL)
-                {
-                    fprintf(stderr,"Error allocating write buffer");
-                    exit(1);
-                }
             }
-
 
             //Analysis
             if (job->qFlag)
@@ -1035,26 +1026,17 @@ void thread_index(void * dummy)
 
                 for (size_t line = (job->start + 1); line < job->end; line++)
                 {
+                    job->countedArr[actualIndex]++;
 
                     if (mystrcmp(job->DeDupeMap[line], job->DeDupeMap[actualIndex]) == 0)
                     {
 
-                        job->countedArr[actualIndex]++;
+                        //job->countedArr[actualIndex]++;
 
                         if (job->write_dupe ==1)
                         {
-
                             buffer_string2(&Write_Buffer,job->DeDupeMap[line],MAX_READ);
-
-                            if (Write_Buffer.bufferUsed > 30000000)
-                            {
-                                possess(DupeWrite_Lock);
-                                    fwrite(Write_Buffer.buffer, 1, Write_Buffer.bufferUsed, dupePtr);
-                                release(DupeWrite_Lock);
-                                Write_Buffer.bufferSize = WriteBufferSize + 1;
-                                Write_Buffer.bufferUsed = 0;
-                                Write_Buffer.writeCount = 0;
-                            }
+                            flushBuffer(&Write_Buffer,dupePtr,0);
                         }
 
                         job->DeDupeMap[line][0] = 10;
@@ -1062,7 +1044,7 @@ void thread_index(void * dummy)
                     else
                     {
 
-                        job->countedArr[actualIndex]++;
+                        //job->countedArr[actualIndex]++;
 
                         actualIndex++;
 
@@ -1087,16 +1069,7 @@ void thread_index(void * dummy)
                         {
 
                             buffer_string2(&Write_Buffer,job->DeDupeMap[line],MAX_READ);
-
-                            if (Write_Buffer.bufferUsed > 30000000)
-                            {
-                                possess(DupeWrite_Lock);
-                                    fwrite(Write_Buffer.buffer, 1, Write_Buffer.bufferUsed, dupePtr);
-                                release(DupeWrite_Lock);
-                                Write_Buffer.bufferSize = WriteBufferSize + 1;
-                                Write_Buffer.bufferUsed = 0;
-                                Write_Buffer.writeCount = 0;
-                            }
+                            flushBuffer(&Write_Buffer,dupePtr,0);
                         }
 
                         job->DeDupeMap[line][0] = 10;
@@ -1111,17 +1084,10 @@ void thread_index(void * dummy)
             }
 
 
-
             //Clean up dupe-buffer
             if (job->write_dupe ==1)
             {
-                if (Write_Buffer.bufferUsed > 0)
-                {
-                    possess(DupeWrite_Lock);
-                        fwrite(Write_Buffer.buffer, 1, Write_Buffer.bufferUsed, dupePtr);
-                    release(DupeWrite_Lock);
-                    Write_Buffer.bufferUsed = 0;
-                }
+                flushBuffer(&Write_Buffer,dupePtr,1);
                 free(Write_Buffer.buffer);
             }
 
@@ -1161,11 +1127,19 @@ void thread_search(void * dummy)
 
         if (WorkHead == NULL)
         {
+            fprintf(stderr, "Job null in procjob\n");
             release(WorkWaiting);
             exit(1);
         }
 
         job = WorkHead;
+        /*
+        if (job->op == JOB_DONE) {
+                release(WorkWaiting);
+                return;
+        }
+        */
+
         WorkHead = job->next;
         if (WorkHead == NULL)
             WorkTail = &WorkHead;
@@ -1190,7 +1164,7 @@ void thread_search(void * dummy)
 
             if (searchHits != 0)
             {
-                __sync_fetch_and_add(&hitCounters[file_id], searchHits);
+                __sync_fetch_and_add(&hitCounters[file_id * COUNTER_STRIDE], searchHits);
             }
 
             return;
@@ -1213,7 +1187,7 @@ void thread_search(void * dummy)
             {
                 if (searchHits != 0)
                 {
-                    __sync_fetch_and_add(&hitCounters[file_id], searchHits);
+                    __sync_fetch_and_add(&hitCounters[file_id * COUNTER_STRIDE], searchHits);
                 }
                 searchHits = 0;
                 file_id = job->file_id;
@@ -1248,6 +1222,8 @@ void thread_search(void * dummy)
                     {
                         if(BinarySearchOG(job->node_refstruct.pointerMap[iLoop], job->node_filestruct.pointerMap, start, end)!=-1)
                             searchHits++;
+                        //if(BinarySearchOG(job->node_refstruct.pointerMap[iLoop], job->node_filestruct.pointerMap, 0, job->node_filestruct.itemCount)!=-1)
+                            //searchHits++;
                     }
                     else
                     {
@@ -1262,7 +1238,7 @@ void thread_search(void * dummy)
                             if (segmentIndex < 0)
                                 segmentIndex = 0;
 
-                            pthread_mutex_lock(&pointerMapMutexes[segmentIndex]);
+                            pthread_mutex_lock(&pointerMapMutexes[segmentIndex].mutex);
 
                             for (long long int inner = index-1; inner > start; inner--)
                             {
@@ -1302,7 +1278,7 @@ void thread_search(void * dummy)
                                     break;
                                 }
                             }
-                            pthread_mutex_unlock(&pointerMapMutexes[segmentIndex]);
+                            pthread_mutex_unlock(&pointerMapMutexes[segmentIndex].mutex);
                         }
 
                     }
@@ -1319,16 +1295,7 @@ void thread_search(void * dummy)
 
         case 1:; // Write mode
             WBuffer Write_Buffer;
-            Write_Buffer.bufferSize = WriteBufferSize + 1;
-            Write_Buffer.bufferUsed = 0;
-            Write_Buffer.writeCount = 0;
-
-            Write_Buffer.buffer = (char *)malloc(WriteBufferSize + 1);
-            if (Write_Buffer.buffer ==NULL)
-            {
-                fprintf(stderr,"Error allocating write buffer");
-                exit(1);
-            }
+            initWriteBuffer(&Write_Buffer);
 
             char * ptr;
 
@@ -1341,9 +1308,9 @@ void thread_search(void * dummy)
                 {
                     if (isTagged(job->node_filestruct.pointerMap[iLoop]) == job->cFlag)
                     {
-                        BuffRem = job->node_filestruct.endAddress - (uintptr_t)job->node_filestruct.pointerMap[iLoop];
                         ptr = untagPointer(job->node_filestruct.pointerMap[iLoop]);
-                        buffer_string2(&Write_Buffer, ptr,BuffRem);
+                        BuffRem = job->node_filestruct.endAddress - (uintptr_t)ptr;
+                        buffer_string2(&Write_Buffer, ptr,BuffRem+1);
                         localWriteCount++;
                     }
                 }
@@ -1356,7 +1323,7 @@ void thread_search(void * dummy)
                     {
                         BuffRem = job->node_filestruct.endAddress - (uintptr_t)job->node_filestruct.pointerMap[iLoop];
                         ptr = untagPointer(job->node_filestruct.pointerMap[iLoop]);
-                        buffer_string3(occuranceCounter,iLoop,&Write_Buffer, ptr,BuffRem);
+                        buffer_string3(occuranceCounter,iLoop,&Write_Buffer, ptr,BuffRem,count_limit);
                         localWriteCount++;
                     }
                 }
@@ -1373,6 +1340,9 @@ void thread_search(void * dummy)
                 twist(WriteOrder, BY, +1);
 
             __sync_fetch_and_add(job->counter, localWriteCount);
+
+            // Do not free free OG buffer since writes are still pending, only this part is done
+
             break;
 
 
@@ -1390,17 +1360,17 @@ void thread_search(void * dummy)
             release(DupeWrite_Lock);
 
             free(job->node_filestruct.buffer);
-
+            free(job->node_filestruct.pointerMap);
 
             break;
 
         case 3: //Index mode (build by chunks)
             IndexFile(&job->node_filestruct);
 
-            size_t buf_max = &(job->node_filestruct.buffer) + job->node_filestruct.buffer_size;
+            //size_t buf_max = &(job->node_filestruct.buffer) + job->node_filestruct.buffer_size;
+            size_t buf_max =  job->node_filestruct.buffer_size;
             buf_max++;
 
-            uint32_t digests[4];
             for (size_t iLoop = 0; iLoop < job->node_filestruct.itemCount; iLoop++)
             {
 
@@ -1422,18 +1392,10 @@ void thread_search(void * dummy)
         case 4: //Index mode (search by chunks)
             IndexFile(&job->node_filestruct);
             localWriteCount = 0;
-            Write_Buffer.bufferSize = WriteBufferSize + 1;
-            Write_Buffer.bufferUsed = 0;
-            Write_Buffer.writeCount = 0;
+            initWriteBuffer(&Write_Buffer);
 
-            Write_Buffer.buffer = (char *)malloc(WriteBufferSize + 1);
-            if (Write_Buffer.buffer ==NULL)
-            {
-                fprintf(stderr,"Error allocating write buffer");
-                exit(1);
-            }
-
-            buf_max = &(job->node_filestruct.buffer) + job->node_filestruct.buffer_size;
+            //buf_max = &(job->node_filestruct.buffer) + job->node_filestruct.buffer_size;
+            buf_max = job->node_filestruct.buffer_size;
             BuffRem = 0;
             buf_max++;
             for (size_t iLoop = 0; iLoop < job->node_filestruct.itemCount; iLoop++)
@@ -1460,10 +1422,34 @@ void thread_search(void * dummy)
             free(job->node_filestruct.buffer);
             free(job->node_filestruct.pointerMap);
             break;
+        case 5: // Similar mode, scan and write
+            IndexFile(&job->node_filestruct);
+            localWriteCount = 0;
 
+            initWriteBuffer(&Write_Buffer);
+
+            for (iLoop = 0; iLoop < job->node_filestruct.itemCount; iLoop++)
+            {
+                if (roaring64_bitmap_contains(FinalMap,get_cluster_hash(job->node_filestruct.pointerMap[iLoop],0xFFFFFFF)))
+                {
+                    buffer_string2(&Write_Buffer,job->node_filestruct.pointerMap[iLoop],MAX_READ);
+                    flushBuffer(&Write_Buffer,writePtr,0);
+                    localWriteCount++;
+                }
+            }
+
+            flushBuffer(&Write_Buffer,writePtr,1);
+            __sync_fetch_and_add(&lineCount,job->node_filestruct.itemCount);
+            __sync_fetch_and_add(&Progress_Reads,localWriteCount);
+            free(job->node_filestruct.pointerMap);
+            free(job->node_filestruct.buffer);
+            free(Write_Buffer.buffer);
+
+        break;
         }
 
         possess(FreeWaiting);
+        job->next = NULL;
         if (FreeTail)
         {
             *FreeTail = job;
@@ -1481,7 +1467,7 @@ void thread_search(void * dummy)
 void sizeUsage(size_t in) {
     int counter = 0;
     double size = in;
-    while(size > 1000)
+    while(size > 1024)
     {
         size = size/1024;
         counter++;
@@ -1523,6 +1509,10 @@ if (argc == 1) {
         "Usage: %s inputfile [ref1] [ref2] [ref3] [options]\n"
         "Options:\n"
         "\t-t [threads]  Number of threads where MT is used\n"
+        "\t-z [num]      Sort by similar mode, specify shingle number\n"
+        "\t\t\t High -z results is less collisions, more similar clustering\n"
+        "\t\t\t Low -z results is more collisions, less similar clustering\n"
+        "\t-Z [dir]      Output similar mode by clusterfile to dir by appending, default to stdout\n"
         "\t-m            Enable lookup map, useful for high number of searches\n"
         "\t-o [file]     Output to a file, defaults to stdout\n"
         "\t-n            Do not remove duplicates\n"
@@ -1531,12 +1521,16 @@ if (argc == 1) {
         "\t-e [char]     Limit matching up to a specified character (not implemented)\n"
         "\t-p            Input list is pre-sorted, do not perform sort\n"
         "\t-D [file]     Write duplicates to file\n"
+        "\t-S mem|parts  Use positive values for RAM limit use negative for parts\n"
+        "\t\t\t -S 400M/20G/1T RAM limits\n"
+        "\t\t\t -S -2/-10/-20 2,10,20 parts\n"
+        "\t-T [dir]      Temp dir to swap part files in\n"
         "\t-r [dir]      Read and recurse a directory (not implemented)\n"
         "\t-L, --count   Line Count with longest count\n"
         "\t-q            Occurance analysis outputs as TSV format\n"
         "\t-C [count]    Limit output to min count occurrance (outputs 1 instance)\n"
         "\t-j, --json    Output stats as json\n"
-        "V-j, --version  Output version information\n\n"
+        "\t-V, --version Output version information\n\n"
         "Indexing modes:\n"
         "\t-i [file]     Index to file to disk\n"
         "\t-I            Index to file memory\n"
@@ -1549,9 +1543,12 @@ if (argc == 1) {
     return -1;
 }
 
-    char *ivalue = NULL, *idxvalue = NULL, *bitsValue = NULL, *tvalue = NULL, *ovalue = NULL, *rvalue = NULL, *Dvalue = NULL;
-    int mFlag = 0, nFlag = 0,cFlag = 0, pFlag = 0, LFlag = 0, qFlag = 0, jFlag = 0, sFlag = 0, kFlag = 0, IFlag = 0;
-    long limit = 0;
+    char *ivalue = NULL, *idxvalue = NULL, *tvalue = NULL, *ovalue = NULL, *rvalue = NULL, *Dvalue = NULL, *Rvalue = NULL, *Svalue = NULL,*Tvalue = NULL, *zValue = NULL, *ZDir = NULL;
+    int mFlag = 0, nFlag = 0, cFlag = 0, pFlag = 0, LFlag = 0, qFlag = 0, jFlag = 0, sFlag = 0, kFlag = 0, IFlag = 0 ;
+
+    long long int S_limit_MB = 0;
+    size_t maxParts = 0;
+
 
     int c;
     JOB *job;
@@ -1573,7 +1570,7 @@ if (argc == 1) {
                 {0, 0, 0, 0}};
         int option_index = 0;
 
-        c = getopt_long(argc, argv, "VrnmhcpqsLjkIt:o:l:D:i:b:C:",
+        c = getopt_long(argc, argv, "VrnmhcpqsLjkIZ:z:t:o:l:D:i:b:C:S:T:",
                         long_options, &option_index);
 
         if (c == -1)
@@ -1592,6 +1589,14 @@ if (argc == 1) {
         case 'V':
             printf("%s\n\n",version);
             return(0);
+        case 'z':
+            zValue = optarg;
+            setShigle_size(atoi(zValue));
+            fprintf(stderr,"Processing in similarty mode. Shingle set to: %d\n",atoi(zValue));
+            break;
+        case 'Z':
+            ZDir = optarg;
+            break;
         case 'I':
             IFlag = true;
             indxmode = 3;
@@ -1673,6 +1678,9 @@ if (argc == 1) {
         case 'D':
             Dvalue = optarg;
             break;
+        case 'T':
+            Tvalue = optarg;
+            break;
         case 'l':
             if (isdigit(*optarg))
                 LenMatch = atoi(optarg);
@@ -1683,14 +1691,68 @@ if (argc == 1) {
         case '?':
             fprintf(stderr, "Unknown argument -%c\n", optopt);
             break;
+        case 'S':
+                Svalue = optarg;
 
+                if (Svalue[0] == '-') {
+                    // Attempt to parse as integer
+                    long negative_val = atol(Svalue);
+
+                    // Error handling: ensure it is less than -1
+                    if (negative_val >= -1) {
+                        fprintf(stderr, "Error: Argument for -R must be less than -1 (e.g., -2, -20). Value provided: %s\n", Svalue);
+                        exit(1);
+                    }
+
+
+                    // Inverse the negative value to store in maxParts (e.g., -5 becomes 5)
+                    maxParts = negative_val * -1;
+
+            } else {
+
+
+                // Parse the size string (e.g., "2.4GB")
+                char *endptr;
+                double size_input = strtod(Svalue, &endptr);
+
+                // Check if parsing failed or nothing was read
+                if (endptr == Svalue) {
+                    fprintf(stderr, "Error: Invalid size format for -R (%s). Expected format like 1MB, 2.5GB.\n", Svalue);
+                    exit(1);
+                }
+
+                if (strcasecmp(endptr, "KB") == 0 || strcasecmp(endptr, "K") == 0) {
+                    size_input /= 1000.0;
+                } else if (strcasecmp(endptr, "MB") == 0 || strcasecmp(endptr, "M") == 0) {
+                    // Already in MB
+                } else if (strcasecmp(endptr, "GB") == 0 || strcasecmp(endptr, "G") == 0) {
+                    size_input *= 1000.0;
+                } else if (strcasecmp(endptr, "TB") == 0 || strcasecmp(endptr, "T") == 0) {
+                    size_input *= 1000000.0;
+                } else {
+                    fprintf(stderr, "Error: Unknown size suffix '%s' for -R. Supported: KB, MB, GB, TB, use negatives for parts eg -R -2\n", endptr);
+                    exit(1);
+                }
+
+                S_limit_MB = (long long)size_input;
+            }
+            break;
         default:
             abort();
         }
     }
 
+    if (S_limit_MB != 0 || maxParts != 0)
+    {
+        if (S_limit_MB) fprintf(stderr,"Limiting RAM usage to %lld MBytes\n",S_limit_MB);
+        if (maxParts) fprintf(stderr,"Running the sort in %lld parts\n",maxParts);
+    }
     ProcessingStats stats;
 
+    if (ZDir != NULL)
+    {
+        fprintf(stderr,"Writing clusters to DIR: %s\n",ZDir);
+    }
 
     if (Dvalue != NULL)
     {
@@ -1747,7 +1809,7 @@ if (argc == 1) {
 
     while (opCheck < argc)
     {
-        if (FileExists(argv[optind]))
+        if (FileExists(argv[opCheck]))
         {
             validFiles++;
         }
@@ -1768,10 +1830,13 @@ if (argc == 1) {
             {
                 if (qFlag)
                 {
-                    if (count_limit == 0)
+                    if (count_limit == 0){
                         if (!jFlag) fprintf(stderr, "Occurance analysis\n");
-                    else
-                        if (!jFlag) fprintf(stderr, "Output occurance limit to %ld\n",count_limit);
+                    }
+                    else{
+                        if (!jFlag) fprintf(stderr, "Output occurance limit to %zu\n",count_limit);
+                    }
+
                 }
                 else{
                     if (!jFlag) fprintf(stderr, "No valid reference files specified, running in sort mode\n");
@@ -1864,7 +1929,7 @@ if (argc == 1) {
 
             const char* reason = NULL;  // Will store the error message if validation fails
 
-            if (!roaring64_bitmap_internal_validate(SearchMap, &reason)) {
+            if (!roaring64_bitmap_internal_validate(FinalMap, &reason)) {
                 fprintf(stderr, "Index failed validation: %s exiting\n", reason);
                 exit(1);
             }
@@ -1919,7 +1984,7 @@ if (argc == 1) {
     if (!jFlag) fprintf(stderr, "Reading input: %s\n", ivalue);
     file_struct input;
 
-    if (strcmp(ivalue,"stdin") == 0)
+    if (strcmp(ivalue,"stdin") == 0) // Reading from stdin
     {
         input.f_name = ivalue;
         if (VirtualOpen(&input) != 1)
@@ -1928,7 +1993,7 @@ if (argc == 1) {
             return -1;
         }
     }
-    else
+    else // Reading from file
     {
         input.f_name = ivalue;
         if (OpenFile02(&input) != 1)
@@ -1939,7 +2004,6 @@ if (argc == 1) {
     }
 
     stats.inputFile = ivalue;
-
     file_struct reference;
 
     unsigned int threads_count = get_nprocs();
@@ -1954,12 +2018,17 @@ if (argc == 1) {
 
     // Dynamically create the job units
     unsigned int WUs = threads_count * 4;
+    if (Svalue != NULL)
+    {
+        WUs = threads_count * 1.5; // reduce threads is running in low mem mode
+    }
     jobs = (JOB *)malloc(WUs * sizeof(JOB));
     if (jobs == NULL)
     {
         fprintf(stderr,"Unable to allocate memory for jobs\n");
         exit(1);
     }
+
     buildFree(WUs);
 
     size_t i = 0;
@@ -1983,7 +2052,7 @@ if (argc == 1) {
     if (IFlag)
         idxvalue = ivalue;
 
-    if (SearchMap[0] == NULL && idxvalue != NULL) {
+    if (SearchMap[0] == NULL && idxvalue != NULL) { // using bitmap, allocate memory
         // bitmap not properly initialized
         fprintf(stderr, "Using %d-bits for index\n",count_mask_bits(mask_bits));
         for (int i = 0; i<17;i++)
@@ -2013,7 +2082,115 @@ if (argc == 1) {
     #endif
 
     size_t totalRead = 0;
-ReRun:
+
+    // Valid reference file and shingvalue z set. Process in partial mode
+    if (validFiles > 0 && zValue != NULL){
+
+        fprintf(stderr,"Reading file %s\n",argv[optind]);
+        if (FileExists(argv[optind]))
+        {
+            reference.f_name = argv[optind];
+        }
+
+        OpenFile02(&reference);
+
+
+        /*  // Unsued until parallel code added
+        for (int temp = 0; temp<17; temp++)
+        {
+            SearchMap[temp] = roaring64_bitmap_create();
+
+            if (SearchMap[temp] == NULL) {
+                fprintf(stderr,"Unable to create index, exiting\n");
+            }
+        }
+        */
+
+        size_t forkelem;
+        forkelem = 65536;
+        if (forkelem > reference.itemCount){
+            forkelem = reference.itemCount / 2;
+        }
+        if (forkelem < 1024){
+            forkelem = 1024;
+        }
+
+        //qsort_mt(reference.pointerMap, reference.itemCount, sizeof(char **), comp_cluster, threads_count, forkelem); // Sim sort
+        FinalMap = roaring64_bitmap_create();
+        if (FinalMap == NULL) {
+            fprintf(stderr,"Unable to create index, exiting\n");
+            exit(0);
+        }
+
+        //ReadFileAll(&reference);
+        //IndexFile(&reference);
+        while (reference.f_rem != 0)
+        {
+            ReadFile02(&reference);
+
+
+            double read = (double)reference.bytesRead / (double)reference.f_size;
+            if (!jFlag) fprintf(stderr, "\r%0.2f%% ", read * 100);
+            fflush(stderr);
+            IndexFile(&reference);
+            for(size_t iLoop = 0; iLoop<reference.itemCount; iLoop++)
+            {
+                roaring64_bitmap_add(FinalMap,get_cluster_hash(reference.pointerMap[iLoop],0xFFFFFFF));
+            }
+        }
+
+
+        OpenFile02(&input);
+        for (i = 0; i < WUs; i++)
+        {
+            jobs[i].node_filestruct = input;
+            jobs[i].mode = 5;
+            jobs[i].time = 0;
+        }
+
+        for (i = 0; i < threads_count; i++)
+        {
+            launch(thread_search, NULL);
+        }
+        possess(ThreadLock);
+        twist(ThreadLock, BY, threads_count);
+
+        while (input.f_rem != 0)
+        {
+            double read = (double)input.bytesRead / (double)input.f_size;
+            if (!jFlag) fprintf(stderr, "\r%0.2f%% ", read * 100);
+            fflush(stderr);
+
+            if (job)
+                ReadFile02(&input);
+
+            possess(FreeWaiting);
+            wait_for(FreeWaiting, TO_BE_MORE_THAN, 0);
+            job = FreeHead;
+            FreeHead = job->next;
+            twist(FreeWaiting, BY, -1);
+
+            job->next = NULL;
+            job->node_filestruct = input;
+            input.buffer_size = 0;
+
+            addWork(job, false);
+
+        }
+
+        if (!jFlag) fprintf(stderr, "\r100.00%%");
+        fflush(stderr);
+
+        possess(FreeWaiting);
+        wait_for(FreeWaiting, TO_BE, WUs - 1);
+        release(FreeWaiting);
+
+        size_t_to_pretty(Progress_Reads, pretty, sizeof(pretty));
+        size_t_to_pretty(lineCount, pretty2, sizeof(pretty2));
+        fprintf(stderr, "\nWrote %s/%s similar matches\n", pretty,pretty2);
+        fprintf(stderr, "Process completed in %.3f seconds\n", time_elapsed(&clock_start,1));
+        exit(0);
+    }
 
     if (strcmp(input.f_name,"stdin") == 0)
     {
@@ -2092,7 +2269,7 @@ ReRun:
         if (LFlag) //Length analysis
         {
             useMode = 2; //Analysis
-            adjustChunk(5);
+            adjustChunk(&input,5);
         }
         else
             useMode = indxmode;
@@ -2125,7 +2302,7 @@ ReRun:
             fflush(stderr);
 
             if (job)
-            ReadFile02(&input);
+                ReadFile02(&input);
 
             possess(FreeWaiting);
             wait_for(FreeWaiting, TO_BE_MORE_THAN, 0);
@@ -2165,7 +2342,7 @@ ReRun:
             fprintf(stderr, "\rLine count: %s\n", pretty);
             size_t_to_pretty(lineMax, pretty, sizeof(pretty));
             fprintf(stderr, "\rLongest line: %s\n", pretty);
-            fprintf(stderr, "Finished took %.3f seconds\n", time_elapsed(&clock_start,1));
+            fprintf(stderr, "Process completed in %.3f seconds\n", time_elapsed(&clock_start,1));
             return(0);
             }
         }
@@ -2201,7 +2378,7 @@ ReRun:
                     fprintf(stderr,"Reading file %s\n",input.f_name);
                     optind++;
                     indxmode = 4;
-                    goto ReRun;
+
                 }
                 else
                 {
@@ -2276,7 +2453,7 @@ ReRun:
                     fprintf(stderr,"Reading file %s\n",input.f_name);
                     optind++;
                     indxmode = 4;
-                    goto ReRun;
+
                 }
                 else
                 {
@@ -2291,24 +2468,567 @@ ReRun:
             fprintf(stderr,"\nTotal matched: %s took %.3f seconds\n",pretty,time_elapsed(&clock_running,1));
         }
 
-        fprintf(stderr, "Finished took %.3f seconds\n", time_elapsed(&clock_start,1));
+        fprintf(stderr, "Process completed in %.3f seconds\n", time_elapsed(&clock_start,1));
         return(0);
     }
-    else
+    else // Not analysis mode, not stdin
     {
-        ReadFileAll(&input);
-        if (mFlag)
+        if (maxParts == 0 && S_limit_MB == 0) // Single part processing
         {
-            for (int temp = 0; temp<17; temp++)
+            ReadFileAll(&input);
+            if (mFlag)
             {
-                SearchMap[temp] = roaring64_bitmap_create();
+                for (int temp = 0; temp<17; temp++)
+                {
+                    SearchMap[temp] = roaring64_bitmap_create();
 
-                if (SearchMap[temp] == NULL) {
-                    fprintf(stderr,"Unable to create index, exiting\n");
-                    exit(1);
+                    if (SearchMap[temp] == NULL) {
+                        fprintf(stderr,"Unable to create index, exiting\n");
+                        exit(1);
+                    }
                 }
             }
         }
+        else if(maxParts != 0 || S_limit_MB != 0) // Multi part processing
+        {
+            size_t splitSize = 0;
+            if (maxParts != 0){
+                splitSize = (input.f_size + maxParts - 1) / maxParts;
+            }
+            else if (S_limit_MB != 0){
+                splitSize = (S_limit_MB*1000000)/4;
+            }
+
+            input.chunkSize = splitSize;
+            //setChunksize(splitSize);
+            size_t currentPart = 0;
+            char part_filename[2000];
+            WBuffer Write_Buffer;
+
+            initWriteBuffer(&Write_Buffer);
+
+            size_t totalWrites = 0;
+
+
+            // Init MT buffer processing
+            read_eof_flag = 0;
+            read_buf_ready[0] = 0;
+
+
+            pthread_t reader_tid;
+            pthread_create(&reader_tid, NULL, prefetch_reader_thread, &input);
+
+            // Main Consumer Loop
+
+            while (1) {
+                // 1. Wait for data to be ready
+                pthread_mutex_lock(&read_mutex);
+                while (read_buf_ready[0] == 0 && read_eof_flag == 0) {
+                    pthread_cond_wait(&read_cond_consumer, &read_mutex);
+                }
+
+                // Check for EOF termination
+                if (read_eof_flag && read_buf_ready[0] == 0) {
+                    pthread_mutex_unlock(&read_mutex);
+                    break;
+                }
+
+                // 2. Swap data into 'input' struct for processing
+                // We map the buffer data into the main struct so existing code works
+                input.buffer = read_buffers[0].buffer;
+                input.buffer_size = read_buffers[0].buffer_size;
+                input.pointerMap = read_buffers[0].pointerMap;
+                input.itemCount = read_buffers[0].itemCount;
+                input.endAddress = read_buffers[0].endAddress;
+
+                // Mark this buffer slot as consumed
+                read_buf_ready[0] = 0;
+
+                // Signal producer it can fill this slot again
+                pthread_cond_signal(&read_cond_producer);
+
+                pthread_mutex_unlock(&read_mutex);
+
+                // 3. Process the chunk (Standard Logic)
+                // Note: bytesRead is already updated in 'input' by the thread for progress display
+
+                size_t forkelem;
+                forkelem = 65536;
+                if (forkelem > input.itemCount) forkelem = input.itemCount / 2;
+                if (forkelem < 1024) forkelem = 1024;
+
+                // Progress Display (using atomic bytesRead updated by thread)
+                double read = (double)input.bytesRead / (double)input.f_size;
+                if (!jFlag) fprintf(stderr, "\r%0.2f%% ", read * 100);
+                fflush(stderr);
+
+
+                qsort_mt(input.pointerMap, input.itemCount, sizeof(char **), compareStrings, threads_count, forkelem);
+                size_t originalCount = input.itemCount;
+                totalRead +=input.itemCount;
+                // If de-duping
+                if (validFiles)
+                {
+                    nFlag = false; // Force duplication if cross checking
+                }
+
+
+                if (nFlag == false)
+                {
+                    if (input.itemCount > 0)
+                    {
+
+                        size_t deDuped = 1;
+
+                        for (size_t iLoop = 1; iLoop < input.itemCount; iLoop++)
+                        {
+
+                            if (mystrcmp(input.pointerMap[iLoop], input.pointerMap[deDuped - 1]) != 0)
+                            {
+                                input.pointerMap[deDuped] = input.pointerMap[iLoop];
+                                deDuped++;
+                            }
+                        }
+                        input.itemCount = deDuped;
+                    }
+                }
+
+                input.itemTotal = input.itemCount;
+
+
+                if (validFiles > 0){
+
+                    memset(binary_index_start, 0, sizeof(binary_index_start));
+                    memset(binary_index_end, 0, sizeof(binary_index_end));
+
+                    size_t curr = 0, last = 0;
+                    for (size_t iLoop = 0; iLoop < input.itemCount; iLoop++)
+                    {
+                        curr = (unsigned char)input.pointerMap[iLoop][0];
+                        if (curr != last)
+                        {
+                            binary_index_start[curr] = iLoop;
+                            binary_index_end[last] = iLoop;
+                        }
+                        last = curr;
+                    }
+                    binary_index_end[curr] = input.itemCount;
+
+                        for (i = 0; i < WUs; i++)
+                        {
+                            jobs[i].node_filestruct = input;
+                            jobs[i].mode = 0;
+                            jobs[i].mFlag = mFlag;
+                            jobs[i].time = 0;
+                        }
+
+                        for (i = 0; i < threads_count; i++)
+                        {
+                            launch(thread_search, NULL);
+                        }
+                        possess(ThreadLock);
+                        twist(ThreadLock, BY, threads_count);
+
+                        //hitCounters = (size_t*)calloc((argc-optind),sizeof(size_t));
+                        size_t num_files = argc - optind;
+                        hitCounters = (size_t*)calloc(num_files * COUNTER_STRIDE, sizeof(size_t));
+                        if (hitCounters == NULL) {
+                            fprintf(stderr, "Failed to allocate memory for hitCounters\n");
+                            exit(1);
+                        }
+
+
+                        long file_id = 0;
+                        long optind_restore = optind;
+
+                        //Loop through the user specified files and process them
+                        while (optind < argc)
+                        {rvalue = argv[optind];
+                            optind++;
+                            reference.f_name = rvalue;
+
+                            if (OpenFile02(&reference) != 1)
+                            {
+                                fprintf(stderr, "File %s doesn't exist or is invalid\n", rvalue);
+                                continue;
+                            }
+
+                            if (!jFlag) fprintf(stderr, "Reading file %s\n", rvalue);
+
+                            while (reference.f_rem != 0)
+                            {
+                                double read = (double)reference.bytesRead / (double)reference.f_size;
+                                if (!jFlag)
+                                {
+                                    fprintf(stderr, "\r%0.2f%% ", read * 100);
+                                    fflush(stderr);
+                                }
+
+                                if (job)
+                                ReadFile02(&reference);
+
+                                possess(FreeWaiting);
+                                wait_for(FreeWaiting, TO_BE_MORE_THAN, 0);
+                                job = FreeHead;
+                                FreeHead = job->next;
+                                twist(FreeWaiting, BY, -1);
+
+                                job->next = NULL;
+                                job->node_refstruct = reference;
+                                reference.buffer_size = 0;
+                                job->file_id = file_id;
+
+                                addWork(job, false);
+
+                            }
+
+                            if (!jFlag) fprintf(stderr, "\rFinished reading %s E:%zu\n", reference.f_name, reference.extensions);
+
+                            possess(FreeWaiting);
+                            wait_for(FreeWaiting, TO_BE, WUs - 1);
+                            release(FreeWaiting);
+                            CloseFile(&reference);
+                            file_id++;
+                        }
+
+                        optind = optind_restore;
+
+                        jFlag ? stats.timings.searching_seconds = time_elapsed(&clock_running,1): fprintf(stderr, "Searching took %.3f seconds\n", time_elapsed(&clock_running,1));
+
+                        possess(FreeWaiting);
+                        wait_for(FreeWaiting, TO_BE, WUs - 1);
+                        release(FreeWaiting);
+
+                        for (i = 0; i < threads_count; i++)
+                        {
+                            possess(FreeWaiting);
+                            wait_for(FreeWaiting, TO_BE_MORE_THAN, 0);
+                            job = FreeHead;
+                            FreeHead = job->next;
+                            twist(FreeWaiting, BY, -1);
+                            job->next = NULL;
+                            addWork(job, true);
+                        }
+
+                        possess(ThreadLock);
+                        wait_for(ThreadLock, TO_BE, 0);
+                        release(ThreadLock);
+
+                        i = join_all();
+                 }
+
+                if (Tvalue != NULL) {
+                    snprintf(part_filename, sizeof(part_filename), "%s/%s.part%zu", Tvalue, basename(input.f_name), currentPart);
+                } else {
+                    snprintf(part_filename, sizeof(part_filename), "%s.part%zu", input.f_name, currentPart);
+                }
+
+                writePtr = fopen(part_filename,"wb");
+                //fprintf(stderr,"writing %s\n",part_filename);
+
+                size_t writeCounter = 0;
+                //WUs = threads_count * 1.5; // Limit write packets
+                for (i = 0; i < WUs; i++)
+                {
+                    jobs[i].node_filestruct = input;
+                    jobs[i].mode = 1;
+                    jobs[i].cFlag = cFlag;
+                    jobs[i].counter = &writeCounter;
+                    jobs[i].qFlag = qFlag;
+                }
+
+                // Call batched writer
+                for (i = 0; i < threads_count; i++)
+                {
+                    launch(thread_search, i);
+                }
+
+                possess(ThreadLock);
+                twist(ThreadLock, BY, threads_count);
+
+                size_t processedItem = 0;
+                long write_id = 0;
+
+                // Package for writing
+                while (processedItem < input.itemTotal)
+                {
+                    possess(FreeWaiting);
+                    wait_for(FreeWaiting, TO_BE_MORE_THAN, 0);
+                    job = FreeHead;
+                    FreeHead = job->next;
+                    twist(FreeWaiting, BY, -1);
+
+                    job->next = NULL;
+                    job->id = write_id;
+                    job->start = processedItem;
+
+                    if (processedItem + 200000 < input.itemTotal)
+                    {
+                        job->end = processedItem + 200000;
+                    }
+                    else
+                    {
+                        job->end = input.itemTotal;
+                    }
+                    processedItem = job->end;
+                    addWork(job, false);
+                    if (write_id > 2000)
+                    {
+                        write_id = 0;
+                    }
+                    else
+                    {
+                        write_id++;
+                    }
+                }
+
+                for (i = 0; i < threads_count; i++)
+                {
+                    possess(FreeWaiting);
+                    wait_for(FreeWaiting, TO_BE_MORE_THAN, 0);
+                    job = FreeHead;
+                    FreeHead = job->next;
+                    twist(FreeWaiting, BY, -1);
+                    job->next = NULL;
+                    addWork(job, true);
+                }
+
+                possess(ThreadLock);
+                wait_for(ThreadLock, TO_BE, 0);
+
+                release(ThreadLock);
+                i = join_all();
+                fclose(writePtr);
+                currentPart++;
+
+
+                // Reset all locks/WUs for re-use
+                buildFree(WUs);
+                FreeHead = &jobs[0];
+                possess(FreeWaiting);
+                    twist(FreeWaiting, TO, WUs-1);
+                possess(WorkWaiting);
+                    twist(WorkWaiting, TO, 0);
+                possess(WriteOrder);
+                    twist(WriteOrder, TO, 0);
+                possess(ThreadLock);
+                    twist(ThreadLock, TO, 0);
+                WorkHead = NULL;
+                WorkTail = &WorkHead;
+
+                if(input.buffer_size != 0)
+                {
+                    free(input.buffer);
+                    input.buffer_size = 0;
+                    free(input.pointerMap);
+                }
+
+            }
+
+             pthread_join(reader_tid, NULL);
+
+            if (S_limit_MB != 0)
+           {
+               maxParts = currentPart-1; // set this since we know how many parts were created
+           }
+
+            fprintf(stderr,"Finished creating %zu parts on disk in %.3f seconds\n",maxParts+1,time_elapsed(&clock_start,0));
+            fprintf(stderr,"Merging output please wait...\n");
+            file_struct *handlers = (file_struct *)calloc(maxParts+1, sizeof(file_struct));
+            if (!handlers) {
+                perror("Failed to allocate memory for file handlers");
+                exit(EXIT_FAILURE);
+            }
+
+
+            for (size_t i = 0; i <= maxParts; i++) {
+                size_t fn_len = sizeof(part_filename);
+                handlers[i].f_name = (char *)malloc(fn_len);
+                if (!handlers[i].f_name) {
+                    perror("Failed to allocate filename");
+                    exit(EXIT_FAILURE);
+                }
+
+                if (Tvalue != NULL) {
+                    snprintf(handlers[i].f_name, sizeof(part_filename), "%s/%s.part%zu", Tvalue, basename(input.f_name), i);
+                } else {
+                    snprintf(handlers[i].f_name, sizeof(part_filename), "%s.part%zu", input.f_name, i);
+                }
+
+                if (OpenFile02(&handlers[i]) != 1) {
+                    fprintf(stderr, "Failed to open file %s\n", handlers[i].f_name);
+                    continue;
+                }
+
+                ReadFile02(&handlers[i]);
+                IndexFile(&handlers[i]);
+            }
+
+            //Prep double buffering
+            pf_queue_size = maxParts + 2;
+            pfbufs = calloc(maxParts + 1, sizeof(PrefetchBuffer));
+            pf_queue = calloc(pf_queue_size, sizeof(PrefetchRequest));
+            pf_head = pf_tail = pf_stop = 0;
+
+            for (size_t i = 0; i <= maxParts; i++) {
+                pthread_mutex_init(&pfbufs[i].mutex, NULL);
+                pthread_cond_init(&pfbufs[i].cond, NULL);
+                pfbufs[i].ready = 0;
+                pfbufs[i].eof   = (handlers[i].f_rem == 0);
+
+                if (handlers[i].f_rem > 0) {
+                    pf_queue[pf_tail % pf_queue_size] = (PrefetchRequest){
+                        .handler = &handlers[i],
+                        .pb      = &pfbufs[i]
+                    };
+                    pf_tail++;
+                }
+
+            }
+
+            pthread_t pf_thread;
+            pthread_create(&pf_thread, NULL, prefetch_thread, NULL);
+
+            if (ovalue == NULL)
+            {
+                writePtr =  stdout;
+            }
+            else
+            {
+                writePtr = fopen(ovalue,"wb");
+            }
+
+            size_t *read_indices = (size_t *)calloc(maxParts+1, sizeof(size_t));
+
+
+            // MERGE LOOP - LoserTree
+            char *last_written_string = NULL;
+            char *straggleBuffer = NULL;
+            size_t straggleBuffer_size = 0;
+
+
+            int *ltree = (int *)malloc((maxParts+1) * sizeof(int));
+            if (!ltree) {
+                fprintf(stderr, "Failed to allocate memory for loser tree\n");
+                exit(1);
+            }
+
+        // Initial tree build
+        build_loser_tree(ltree, maxParts + 1, handlers, read_indices);
+
+        while (1) {
+            int winner_idx = ltree[0];
+
+            // Check if the overall winner is exhausted
+            if (handlers[winner_idx].f_rem == 0 && read_indices[winner_idx] >= handlers[winner_idx].itemCount) {
+                break;
+            }
+
+            char *winner_string = handlers[winner_idx].pointerMap[read_indices[winner_idx]];
+
+            // De-duplication check
+            if (last_written_string == NULL || mystrcmp(winner_string, last_written_string) != 0) {
+                buffer_string2(&Write_Buffer, winner_string, MAX_READ);
+                totalWrites++;
+                flushBuffer(&Write_Buffer, writePtr, 0);
+
+                // Before advancing, if this is the last string in the buffer and disk data remains,
+                // we must copy it to the straggle buffer because the Prefetcher will swap the memory.
+                if (read_indices[winner_idx] + 1 >= handlers[winner_idx].itemCount && handlers[winner_idx].f_rem > 0) {
+                    size_t needed = strlen(winner_string) + 1;
+                    if (straggleBuffer_size < needed) {
+                        straggleBuffer = realloc(straggleBuffer, needed);
+                        straggleBuffer_size = needed;
+                    }
+                    memcpy(straggleBuffer, winner_string, needed);
+                    last_written_string = straggleBuffer;
+                } else {
+                    last_written_string = winner_string;
+                }
+            }
+
+            read_indices[winner_idx]++;
+
+            // ASYNC REFILL: If the winner's buffer is empty but disk data exists
+            if (read_indices[winner_idx] >= handlers[winner_idx].itemCount && handlers[winner_idx].f_rem > 0) {
+                PrefetchBuffer *pb = &pfbufs[winner_idx];
+
+                pthread_mutex_lock(&pb->mutex);
+                 while (!pb->ready && !pb->eof) {
+                    pthread_cond_wait(&pb->cond, &pb->mutex);
+                }
+
+
+            if (pb->ready) {
+                free(handlers[winner_idx].buffer);
+                free(handlers[winner_idx].pointerMap);
+
+                // Swap in the prefetched data
+                handlers[winner_idx].buffer = pb->buffer;
+                handlers[winner_idx].buffer_size = pb->buffer_size;
+                handlers[winner_idx].pointerMap = pb->pointerMap;
+                handlers[winner_idx].itemCount = pb->itemCount;
+                handlers[winner_idx].endAddress = pb->endAddress;
+                handlers[winner_idx].f_rem = pb->next_f_rem;
+
+                // Reset flags and index
+                pb->ready = 0;
+                read_indices[winner_idx] = 0;
+            } else {
+                // No data ready and EOF flagged -> File is truly finished
+                handlers[winner_idx].f_rem = 0;
+            }
+            pthread_mutex_unlock(&pb->mutex);
+
+            if (handlers[winner_idx].f_rem > 0) {
+                pthread_mutex_lock(&pf_queue_mutex);
+                PrefetchRequest req = { &handlers[winner_idx], pb };
+                pf_queue[pf_tail % pf_queue_size] = req;
+                pf_tail++;
+                pthread_cond_signal(&pf_queue_cond);
+                pthread_mutex_unlock(&pf_queue_mutex);
+            }
+        }
+
+            // Challenge the tree with the new (or exhausted) state
+            adjust_loser_tree(ltree, winner_idx, maxParts + 1, handlers, read_indices);
+        }
+
+
+            free(ltree);
+            free(straggleBuffer);
+            flushBuffer(&Write_Buffer,writePtr,1);
+            pthread_mutex_lock(&pf_queue_mutex);
+            pf_stop = 1;
+            pthread_cond_signal(&pf_queue_cond);
+            pthread_mutex_unlock(&pf_queue_mutex);
+            pthread_join(pf_thread, NULL);
+
+            for (size_t i = 0; i <= maxParts; i++) {
+                pthread_mutex_destroy(&pfbufs[i].mutex);
+                pthread_cond_destroy(&pfbufs[i].cond);
+            }
+            free(pfbufs);
+            free(pf_queue);
+
+            size_t_to_pretty(totalRead-totalWrites, pretty, sizeof(pretty));
+            size_t_to_pretty(totalWrites,pretty2, sizeof(pretty2));
+            fprintf(stderr,"Unique matches %s Wrote %s lines\n",pretty,pretty2);
+            fclose(writePtr);
+            fprintf(stderr,"Cleaning up temp files, please wait...\n");
+            for (size_t i = 0; i <= maxParts; i++) {
+                CloseFile(&handlers[i]); // close handle, so we can unlink
+                if (unlink(handlers[i].f_name) != 0) {
+                    fprintf(stderr, "Warning: Failed to remove temp file %s\n",
+                            handlers[i].f_name);
+                }
+            }
+            free(handlers);
+            free(read_indices);
+            fprintf(stderr,"Total time took %.3f seconds\n",time_elapsed(&clock_start,1));
+            return(1);
+        }
+
     }
     size_t segment = 0;
     size_t chunksize = input.f_size;
@@ -2434,22 +3154,183 @@ ReRun:
     free(subPointerMap);
     jFlag ? stats.timings.reading_seconds = time_elapsed(&clock_running,1): fprintf(stderr, "Reading took %.3f seconds\n", time_elapsed(&clock_running,1));
 
-    //Perform a quicksort on the the pointers
-    if (pFlag == false)
+
+    if (pFlag == false) // Not presorted
     {
         if (!jFlag) fprintf(stderr, "Sorting");
-        long long int forkelem;
+        size_t forkelem;
         forkelem = 65536;
-        if (forkelem > input.itemTotal)
+        if (forkelem > input.itemTotal){
             forkelem = input.itemTotal / 2;
-        if (forkelem < 1024)
+        }
+        if (forkelem < 1024){
             forkelem = 1024;
+        }
 
-        qsort_mt(fullPointerMap, input.itemTotal, sizeof(char **), compareStrings, threads_count, forkelem);
+        if (zValue != NULL)
+        {
+            qsort_mt(fullPointerMap, input.itemTotal, sizeof(char **), comp_cluster, threads_count, forkelem);
+        }
+        else{
+            qsort_mt(fullPointerMap, input.itemTotal, sizeof(char **), compareStrings, threads_count, forkelem);
+        }
+
         jFlag ? stats.timings.sorting_seconds = time_elapsed(&clock_running,1) : fprintf(stderr, " took %.3f seconds\n", time_elapsed(&clock_running,1));
 
     }
 
+
+    WBuffer Write_Buffer;
+    initWriteBuffer(&Write_Buffer);
+    size_t writeCount = 0;
+    if (zValue != NULL) // Similar mode processing
+    {
+        if (ZDir == NULL) // Writing to single file
+        {
+            fprintf(stderr,"Writing please wait...\n");
+          if (count_limit == 0) { // No count specified
+                for (size_t i = 0; i < input.itemTotal; i++) {
+                    buffer_string2(&Write_Buffer, fullPointerMap[i], MAX_READ);
+                    writeCount++;
+                    flushBuffer(&Write_Buffer, writePtr, 0);
+                }
+                flushBuffer(&Write_Buffer, writePtr, 1);
+            } else {
+
+                size_t i = 0;
+                while (i < input.itemTotal) {
+                    uint64_t cluster = get_cluster_hash(fullPointerMap[i], 0xFFFFFFFF);
+                    size_t cluster_start = i;
+                    size_t cluster_count = 0;
+                    // Lookahead
+                    while (i < input.itemTotal &&
+                           get_cluster_hash(fullPointerMap[i], 0xFFFFFFFF) == cluster) {
+                        cluster_count++;
+                        i++;
+                    }
+
+                    if (cluster_count >= count_limit) {
+                        for (size_t j = cluster_start; j < cluster_start + cluster_count; j++) {
+                            buffer_string2(&Write_Buffer, fullPointerMap[j], MAX_READ);
+                            flushBuffer(&Write_Buffer, writePtr, 0);
+                            writeCount++;
+                        }
+                    }
+                }
+                flushBuffer(&Write_Buffer, writePtr, 1);
+            }
+            size_t_to_pretty(writeCount, pretty, sizeof(pretty));
+            fprintf(stderr,"Wrote %s items\n",pretty);
+            fprintf(stderr, "Processing completed in %.3f seconds\n", time_elapsed(&clock_start,1));
+        }
+        else if(ZDir)
+        {
+            #ifdef _WIN
+            _mkdir(ZDir);
+            #else
+            mkdir(ZDir, 0755);
+            #endif
+
+            uint64_t cluster = get_cluster_hash(fullPointerMap[0], 0xFFFFFFFF);
+            uint64_t curr_cluster = 0;
+            FILE *cluster_writePtr = NULL;
+            char cluster_filename[2048];
+            size_t cluster_item_count = 0;
+            size_t cluster_buffer_start = 0;
+            size_t last_flushed_pos = 0;
+
+            for (size_t i = 0; i < input.itemTotal; i++)
+            {
+                curr_cluster = get_cluster_hash(fullPointerMap[i], 0xFFFFFFFF);
+
+                if (curr_cluster != cluster) {
+                    // Previous cluster ended, check if we keep it
+                    if (count_limit > 0 && cluster_item_count < count_limit) {
+                        // Discard this cluster by rewinding buffer to before it started
+                        Write_Buffer.bufferUsed = cluster_buffer_start;
+                        if (cluster_writePtr != NULL) {
+                            fclose(cluster_writePtr);
+                            cluster_writePtr = NULL;
+                            unlink(cluster_filename);
+                        }
+                    } else if (Write_Buffer.bufferUsed > cluster_buffer_start) {
+                        // Write the accepted cluster data to file
+                        if (cluster_writePtr == NULL) {
+                            snprintf(cluster_filename, sizeof(cluster_filename), "%s/%016llx.txt", ZDir, cluster);
+                            fprintf(stderr,"Writing cluster %016llx (%zu items)\n",cluster, cluster_item_count);
+                            cluster_writePtr = fopen(cluster_filename, "wb");
+                            if (cluster_writePtr == NULL) {
+                                fprintf(stderr, "Error opening cluster file: %s\n", cluster_filename);
+                                exit(1);
+                            }
+                        }
+                        fwrite(Write_Buffer.buffer + cluster_buffer_start, 1,
+                               Write_Buffer.bufferUsed - cluster_buffer_start, cluster_writePtr);
+                        fclose(cluster_writePtr);
+                        cluster_writePtr = NULL;
+                    }
+
+                    // New cluster starts
+                    cluster = curr_cluster;
+                    cluster_item_count = 0;
+                    cluster_buffer_start = Write_Buffer.bufferUsed;
+                }
+
+                buffer_string2(&Write_Buffer, fullPointerMap[i], MAX_READ);
+                cluster_item_count++;
+
+                if (Write_Buffer.bufferUsed > 0.9 * WriteBufferSize) {
+                    // Buffer full, flush if current cluster meets threshold
+                    if (count_limit == 0 || cluster_item_count >= count_limit) {
+                        if (cluster_writePtr == NULL) {
+                            snprintf(cluster_filename, sizeof(cluster_filename), "%s/%016llx.txt", ZDir, cluster);
+                            fprintf(stderr,"Flushing cluster %016llx\n",cluster);
+                            cluster_writePtr = fopen(cluster_filename, "ab");
+                            if (cluster_writePtr == NULL) {
+                                fprintf(stderr, "Error opening cluster file: %s\n", cluster_filename);
+                                exit(1);
+                            }
+                        }
+                        fwrite(Write_Buffer.buffer + last_flushed_pos, 1,
+                               Write_Buffer.bufferUsed - last_flushed_pos, cluster_writePtr);
+                    }
+
+                    // Shift remaining buffer data and reset positions
+                    size_t remaining = Write_Buffer.bufferUsed - cluster_buffer_start;
+                    if (remaining > 0) {
+                        memmove(Write_Buffer.buffer, Write_Buffer.buffer + cluster_buffer_start, remaining);
+                    }
+                    Write_Buffer.bufferUsed = remaining;
+                    cluster_buffer_start = 0;
+                    last_flushed_pos = 0;
+                }
+            }
+
+            // Handle final cluster
+            if (Write_Buffer.bufferUsed > cluster_buffer_start) {
+                if (count_limit == 0 || cluster_item_count >= count_limit) {
+                    if (cluster_writePtr == NULL) {
+                        snprintf(cluster_filename, sizeof(cluster_filename), "%s/%016llx.txt", ZDir, cluster);
+                        fprintf(stderr,"Writing cluster %016llx (%zu items)\n",cluster, cluster_item_count);
+                        cluster_writePtr = fopen(cluster_filename, "wb");
+                        if (cluster_writePtr == NULL) {
+                            fprintf(stderr, "Error opening cluster file: %s\n", cluster_filename);
+                            exit(1);
+                        }
+                    }
+                    fwrite(Write_Buffer.buffer + cluster_buffer_start, 1,
+                           Write_Buffer.bufferUsed - cluster_buffer_start, cluster_writePtr);
+                }
+            }
+
+            if (cluster_writePtr != NULL) {
+                fclose(cluster_writePtr);
+            }
+        }
+
+        exit(1);
+
+    }
     //Only run if actually searching
     if (nFlag ==0)
     {
@@ -2469,10 +3350,12 @@ ReRun:
 
         if (qFlag)
         {
-            if (count_limit == 0)
+            if (count_limit == 0){
                 if (!jFlag) fprintf(stderr, "Analysis beginning\n");
-            else
+            }
+            else{
                 if (!jFlag) fprintf(stderr, "Occurance limit starting\n");
+            }
         }
         else
         {
@@ -2585,7 +3468,7 @@ ReRun:
         if (qFlag)
         {
             //heap_sort(occuranceCounter, fullPointerMap, actualEnd,1);
-            sort_arrays(occuranceCounter, fullPointerMap, actualEnd,threads_count);
+            sort_arrays(occuranceCounter, fullPointerMap, actualEnd);
             fprintf(stderr,"Finished\n");
         }
 
@@ -2622,8 +3505,13 @@ ReRun:
 
         for (i = 0; i<input.itemTotal;i++)
         {
+            if (maxParts != 0 || S_limit_MB != 0){ // depending on multi-part
+                curr =(unsigned char)input.pointerMap[i][0];
+            }
+            else{
+                curr =(unsigned char)fullPointerMap[i][0];
+            }
 
-            curr =(unsigned char)fullPointerMap[i][0];
             if (curr != last)
             {
                 binary_index_start[curr] = i;
@@ -2641,11 +3529,12 @@ ReRun:
     {
         if (!jFlag) fprintf(stderr,"Search will match upto length: %d\n",LenMatch);
         for (int i = 0; i < NUM_SEGMENTS; i++) {
-            pthread_mutex_init(&pointerMapMutexes[i], NULL);
+            pthread_mutex_init(&pointerMapMutexes[i].mutex, NULL);
         }
     }
 
-    input.pointerMap = fullPointerMap;
+    if (maxParts == 0 && S_limit_MB == 0)
+        input.pointerMap = fullPointerMap;
 
     for (i = 0; i < WUs; i++)
     {
@@ -2662,7 +3551,7 @@ ReRun:
     possess(ThreadLock);
     twist(ThreadLock, BY, threads_count);
 
-    hitCounters = (size_t*)calloc((argc-optind),sizeof(size_t));
+    hitCounters = (size_t*)calloc((argc-optind) * COUNTER_STRIDE, sizeof(size_t));
     long file_id = 0;
     long optind_restore = optind;
 
@@ -2690,7 +3579,6 @@ ReRun:
                 fflush(stderr);
             }
 
-            // printf("%zu remaining\n",reference.f_rem);
             if (job)
             ReadFile02(&reference);
 
@@ -2711,7 +3599,7 @@ ReRun:
                     if (adjusted + WUs < cycles) //We only run the check when the batch of threads finish (which is what cycles holds)
                     {
                         if (!jFlag) fprintf(stderr,"\rAdjusting workload\n");
-                        adjustChunk(1);
+                        adjustChunk(&reference,1);
                         adjusted = cycles;
                     }
                 }
@@ -2754,11 +3642,12 @@ ReRun:
 
     i = join_all();
 
+
     //Print out the stats for each reference file
     file_id = 0;
     while(optind_restore < argc)
     {
-        size_t_to_pretty(hitCounters[file_id], pretty, sizeof(pretty));
+        size_t_to_pretty(hitCounters[file_id * COUNTER_STRIDE], pretty, sizeof(pretty));
         if (!jFlag) fprintf(stderr, "%s %s\n",argv[optind_restore],pretty);
         optind_restore++;
         file_id++;

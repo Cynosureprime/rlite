@@ -149,7 +149,7 @@ void CountChunkV2(file_struct *file)
         if (file->buffer_size > 2)
         {
             // UTF-8 BOM
-            if ((unsigned char)file->buffer[0] == 239 && (unsigned char)file->buffer[2] == 187 && (unsigned char)file->buffer[2] == 191)
+            if ((unsigned char)file->buffer[0] == 239 && (unsigned char)file->buffer[1] == 187 && (unsigned char)file->buffer[2] == 191)
             {
                 override = 3;
             }
@@ -259,7 +259,7 @@ void count_line_endings_sse(file_struct *file) {
         if (file->buffer_size > 2)
         {
             // UTF-8 BOM
-            if ((unsigned char)file->buffer[0] == 239 && (unsigned char)file->buffer[2] == 187 && (unsigned char)file->buffer[2] == 191)
+            if ((unsigned char)file->buffer[0] == 239 && (unsigned char)file->buffer[1] == 187 && (unsigned char)file->buffer[2] == 191)
             {
                 override = 3;
             }
@@ -388,7 +388,6 @@ void count_line_endings_sse(file_struct *file) {
 
     // Handle remaining bytes with base function
     if (length > 0) {
-        count++;
         count += count_line_endings_sse_single(p, length);
     }
 
@@ -583,7 +582,7 @@ void IndexFile(file_struct *file)
         if (file->buffer_size > 2)
         {
             // UTF-8 BOM
-            if ((unsigned char)file->buffer[0] == 239 && (unsigned char)file->buffer[2] == 187 && (unsigned char)file->buffer[2] == 191)
+            if ((unsigned char)file->buffer[0] == 239 && (unsigned char)file->buffer[1] == 187 && (unsigned char)file->buffer[2] == 191)
             {
                 override = 3;
             }
@@ -629,7 +628,6 @@ void IndexFile(file_struct *file)
     file->pointerMap = (char **)malloc((file->itemCount + 1) * sizeof(char *));
 
     file->pointerMap_size = (file->itemCount) * sizeof(char *);
-
     // Prevent partial items by ensuring everything is \0 delimited to be compatible with string.h functions
     int trigger = 1;
     size_t counter = 0;
@@ -864,6 +862,7 @@ ReRead:
     {
         readsize = file->readsize;
         file->buffer = (char *)calloc(readsize + 16,sizeof(char));
+
         if (file->buffer == NULL)
         {
             fprintf(stderr, "Unable to allocate buffer for reading");
@@ -991,11 +990,12 @@ void ReadFileAll(file_struct *file)
 {
 
     file->buffer = (char *)malloc(file->f_size + 16);
-    file->endAddress = (uintptr_t)file->buffer + file->f_size + 2;
+
     if (file->buffer == NULL)
     {
         fprintf(stderr, "Failed to allocate memory %zu", file->f_size + 16);
     }
+    file->endAddress = (uintptr_t)file->buffer + file->f_size + 2;
     file->buffer_size = file->f_size + 16;
 
     long long int adjustedSize = 0;
