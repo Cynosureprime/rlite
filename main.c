@@ -31,6 +31,7 @@
 
 #include <stdbool.h>
 
+
 #include "threading/yarn.h"
 #include "threading/getinfo.c"
 #include "advFile/advFile.h"
@@ -81,7 +82,7 @@ static size_t pf_queue_size = 0;
 static pthread_mutex_t pf_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  pf_queue_cond  = PTHREAD_COND_INITIALIZER;
 
-#define version "0.42"
+#define version "0.43"
 int mylstrcmp(const char *a, const char *b);
 
 roaring64_bitmap_t *SearchMap[16];
@@ -436,13 +437,15 @@ long long int BinarySearchOG(char *key, char *stringArray[], long long int lo, l
         {
             return -1;
         }
-        if (mystrcmp2(key, stringArray[mid]) == 0)
+        int strcmpRes = 0;
+        strcmpRes = mystrcmp2(key, stringArray[mid]);
+        if (strcmpRes == 0)
         {
             stringArray[mid] = tagPointer(stringArray[mid]);
             return mid;
         }
 
-        if (mystrcmp2(key, stringArray[mid]) < 0)
+        if (strcmpRes < 0)
             hi = mid - 1;
         else
             lo = mid + 1;
@@ -1178,6 +1181,7 @@ void thread_search(void * dummy)
 
         case 0: // Search mode
             clock_gettime(CLOCK_REALTIME, &thread_start);
+
             IndexFile(&job->node_refstruct);
 
             size_t iLoop = 0;
@@ -1497,6 +1501,176 @@ int compareStrings(char **s1, char **s2)
     return mystrcmp(*s1, *s2);
 }
 
+// Dir handling for recursion
+
+static int IsDirectory(const char *path)
+{
+    struct stat st;
+    // Make a copy so we can normalise separators for stat on Windows
+    char tmp[4096];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    for (char *p = tmp; *p; p++)
+        if (*p == '\\') *p = '/';
+    if (stat(tmp, &st) != 0) return 0;
+    return S_ISDIR(st.st_mode);
+}
+
+
+static int glob_match(const char *pattern, const char *name)
+{
+    const char *p = pattern, *n = name;
+    const char *star_p = NULL, *star_n = NULL;
+
+    while (*n)
+    {
+        if (*p == '*')
+        {
+            star_p = ++p;
+            star_n = n;
+        }
+        else if (*p == '?' || *p == *n)
+        {
+            p++; n++;
+        }
+        else if (star_p)
+        {
+            p = star_p;
+            n = ++star_n;
+        }
+        else
+        {
+            return 1;
+        }
+    }
+    while (*p == '*') p++;
+    return *p ? 1 : 0;
+}
+
+static int pattern_match(const char *name, const char *pattern)
+{
+    return glob_match(pattern, name);
+}
+
+// Recursively collect files from dir matching pattern into list/count/cap.
+static void collect_dir_files(const char *dir, const char *pattern,
+                               char ***list, size_t *count, size_t *cap)
+{
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "Warning: cannot open directory %s\n", dir);
+        return;
+    }
+
+    #define PATH_SEP "/"
+
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL)
+    {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+
+        size_t plen = strlen(dir) + 1 + strlen(ent->d_name) + 1;
+        char *full = malloc(plen);
+        if (!full) { perror("malloc"); continue; }
+        snprintf(full, plen, "%s" PATH_SEP "%s", dir, ent->d_name);
+
+        int is_dir = IsDirectory(full);
+        int matched = pattern_match(ent->d_name, pattern);
+
+
+        if (is_dir)
+        {
+            collect_dir_files(full, pattern, list, count, cap);
+            free(full);
+        }
+        else if (matched == 0)
+        {
+            if (*count >= *cap)
+            {
+                *cap = (*cap == 0) ? 64 : *cap * 2;
+                *list = realloc(*list, *cap * sizeof(char *));
+                if (!*list) { perror("realloc"); exit(1); }
+            }
+            (*list)[(*count)++] = full;
+        }
+        else
+        {
+            free(full);
+        }
+    }
+    closedir(d);
+
+#undef PATH_SEP
+}
+
+// Build a flat reference file list from:
+static char **build_ref_list(int argc, char **argv, int optind,
+                              char **rDirs, size_t rDirs_count,
+                              size_t *out_count)
+{
+    char **list = NULL;
+    size_t count = 0, cap = 0;
+
+    // Positional args — plain files only
+    for (int i = optind; i < argc; i++)
+    {
+        const char *arg = argv[i];
+
+
+        if (count >= cap)
+        {
+            cap = (cap == 0) ? 64 : cap * 2;
+            list = realloc(list, cap * sizeof(char *));
+            if (!list) { perror("realloc"); exit(1); }
+        }
+        list[count++] = strdup(arg);
+    }
+
+    // -r entries: "dir" or "dir:pattern"
+    for (size_t i = 0; i < rDirs_count; i++)
+    {
+        char *arg = rDirs[i];
+
+
+        char *colon = strchr(arg, ':');
+        char dir[4096];
+        const char *pattern;
+
+        if (colon)
+        {
+            size_t dirlen = (size_t)(colon - arg);
+            if (dirlen >= sizeof(dir)) dirlen = sizeof(dir) - 1;
+            memcpy(dir, arg, dirlen);
+            dir[dirlen] = '\0';
+            pattern = colon + 1;
+        }
+        else
+        {
+            strncpy(dir, arg, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = '\0';
+            pattern = "*";
+        }
+
+        // Strip trailing separators
+        size_t dlen = strlen(dir);
+        while (dlen > 1 && (dir[dlen-1] == '/' || dir[dlen-1] == '\\'))
+            dir[--dlen] = '\0';
+
+
+        if (!IsDirectory(dir))
+        {
+            fprintf(stderr, "Warning: -r '%s' is not a valid directory\n", dir);
+            continue;
+        }
+
+        collect_dir_files(dir, pattern, &list, &count, &cap);
+    }
+
+    *out_count = count;
+    return list;
+}
 
 int main(int argc, char *argv[])
 {
@@ -1525,7 +1699,7 @@ if (argc == 1) {
         "\t\t\t -S 400M/20G/1T RAM limits\n"
         "\t\t\t -S -2/-10/-20 2,10,20 parts\n"
         "\t-T [dir]      Temp dir to swap part files in\n"
-        "\t-r [dir]      Read and recurse a directory (not implemented)\n"
+        "\t-r [dir]      Recurse directory as reference files, supports dir:*.txt pattern\n"
         "\t-L, --count   Line Count with longest count\n"
         "\t-q            Occurance analysis outputs as TSV format\n"
         "\t-C [count]    Limit output to min count occurrance (outputs 1 instance)\n"
@@ -1545,6 +1719,10 @@ if (argc == 1) {
 
     char *ivalue = NULL, *idxvalue = NULL, *tvalue = NULL, *ovalue = NULL, *rvalue = NULL, *Dvalue = NULL, *Rvalue = NULL, *Svalue = NULL,*Tvalue = NULL, *zValue = NULL, *ZDir = NULL;
     int mFlag = 0, nFlag = 0, cFlag = 0, pFlag = 0, LFlag = 0, qFlag = 0, jFlag = 0, sFlag = 0, kFlag = 0, IFlag = 0 ;
+
+    // Accumulate -r dir[:pattern] arguments
+    char **rDirs = NULL;
+    size_t rDirs_count = 0, rDirs_cap = 0;
 
     long long int S_limit_MB = 0;
     size_t maxParts = 0;
@@ -1570,7 +1748,7 @@ if (argc == 1) {
                 {0, 0, 0, 0}};
         int option_index = 0;
 
-        c = getopt_long(argc, argv, "VrnmhcpqsLjkIZ:z:t:o:l:D:i:b:C:S:T:",
+        c = getopt_long(argc, argv, "VnmhcpqsLjkIZ:z:t:o:l:D:i:b:C:S:T:r:",
                         long_options, &option_index);
 
         if (c == -1)
@@ -1688,6 +1866,16 @@ if (argc == 1) {
         case 'n':
             nFlag = true;
             break;
+        case 'r':
+            // Accumulate -r dir or -r dir:pattern entries
+            if (rDirs_count >= rDirs_cap)
+            {
+                rDirs_cap = (rDirs_cap == 0) ? 8 : rDirs_cap * 2;
+                rDirs = realloc(rDirs, rDirs_cap * sizeof(char *));
+                if (!rDirs) { perror("realloc"); exit(1); }
+            }
+            rDirs[rDirs_count++] = optarg;
+            break;
         case '?':
             fprintf(stderr, "Unknown argument -%c\n", optopt);
             break;
@@ -1804,16 +1992,15 @@ if (argc == 1) {
     }
 
 
-    int opCheck = optind;
+    // Expand reference args: plain files, directories, and glob patterns
+    size_t ref_count = 0;
+    char **ref_list = build_ref_list(argc, argv, optind, rDirs, rDirs_count, &ref_count);
     int validFiles = 0;
 
-    while (opCheck < argc)
+    for (size_t ri = 0; ri < ref_count; ri++)
     {
-        if (FileExists(argv[opCheck]))
-        {
+        if (FileExists(ref_list[ri]))
             validFiles++;
-        }
-        opCheck++;
     }
 
     if (validFiles == 0 && IFlag != 0)
@@ -2128,7 +2315,6 @@ if (argc == 1) {
         {
             ReadFile02(&reference);
 
-
             double read = (double)reference.bytesRead / (double)reference.f_size;
             if (!jFlag) fprintf(stderr, "\r%0.2f%% ", read * 100);
             fflush(stderr);
@@ -2161,8 +2347,7 @@ if (argc == 1) {
             if (!jFlag) fprintf(stderr, "\r%0.2f%% ", read * 100);
             fflush(stderr);
 
-            if (job)
-                ReadFile02(&input);
+            ReadFile02(&input);
 
             possess(FreeWaiting);
             wait_for(FreeWaiting, TO_BE_MORE_THAN, 0);
@@ -2301,8 +2486,7 @@ if (argc == 1) {
             if (!jFlag) fprintf(stderr, "\r%0.2f%% ", read * 100);
             fflush(stderr);
 
-            if (job)
-                ReadFile02(&input);
+            ReadFile02(&input);
 
             possess(FreeWaiting);
             wait_for(FreeWaiting, TO_BE_MORE_THAN, 0);
@@ -2596,6 +2780,13 @@ if (argc == 1) {
                 input.itemTotal = input.itemCount;
 
 
+                // Move to outter loop so we can accumulate
+                hitCounters = (size_t*)calloc(ref_count * COUNTER_STRIDE, sizeof(size_t));
+                if (hitCounters == NULL) {
+                    fprintf(stderr, "Failed to allocate memory for hitCounters\n");
+                    exit(1);
+                }
+
                 if (validFiles > 0){
 
                     memset(binary_index_start, 0, sizeof(binary_index_start));
@@ -2629,22 +2820,12 @@ if (argc == 1) {
                         possess(ThreadLock);
                         twist(ThreadLock, BY, threads_count);
 
-                        //hitCounters = (size_t*)calloc((argc-optind),sizeof(size_t));
-                        size_t num_files = argc - optind;
-                        hitCounters = (size_t*)calloc(num_files * COUNTER_STRIDE, sizeof(size_t));
-                        if (hitCounters == NULL) {
-                            fprintf(stderr, "Failed to allocate memory for hitCounters\n");
-                            exit(1);
-                        }
-
-
                         long file_id = 0;
-                        long optind_restore = optind;
 
-                        //Loop through the user specified files and process them
-                        while (optind < argc)
-                        {rvalue = argv[optind];
-                            optind++;
+                        // Loop through the user specified files and process them
+                        for (size_t ref_idx = 0; ref_idx < ref_count; ref_idx++)
+                        {
+                            rvalue = ref_list[ref_idx];
                             reference.f_name = rvalue;
 
                             if (OpenFile02(&reference) != 1)
@@ -2664,7 +2845,6 @@ if (argc == 1) {
                                     fflush(stderr);
                                 }
 
-                                if (job)
                                 ReadFile02(&reference);
 
                                 possess(FreeWaiting);
@@ -2679,7 +2859,6 @@ if (argc == 1) {
                                 job->file_id = file_id;
 
                                 addWork(job, false);
-
                             }
 
                             if (!jFlag) fprintf(stderr, "\rFinished reading %s E:%zu\n", reference.f_name, reference.extensions);
@@ -2690,8 +2869,6 @@ if (argc == 1) {
                             CloseFile(&reference);
                             file_id++;
                         }
-
-                        optind = optind_restore;
 
                         jFlag ? stats.timings.searching_seconds = time_elapsed(&clock_running,1): fprintf(stderr, "Searching took %.3f seconds\n", time_elapsed(&clock_running,1));
 
@@ -3551,14 +3728,13 @@ if (argc == 1) {
     possess(ThreadLock);
     twist(ThreadLock, BY, threads_count);
 
-    hitCounters = (size_t*)calloc((argc-optind) * COUNTER_STRIDE, sizeof(size_t));
+    hitCounters = (size_t*)calloc(ref_count * COUNTER_STRIDE, sizeof(size_t));
     long file_id = 0;
-    long optind_restore = optind;
 
     //Loop through the user specified files and process them
-    while (optind < argc)
-    {rvalue = argv[optind];
-        optind++;
+    for (size_t ref_idx = 0; ref_idx < ref_count; ref_idx++)
+    {
+        rvalue = ref_list[ref_idx];
         reference.f_name = rvalue;
 
         if (OpenFile02(&reference) != 1)
@@ -3566,6 +3742,7 @@ if (argc == 1) {
             fprintf(stderr, "File %s doesn't exist or is invalid\n", rvalue);
             continue;
         }
+
 
         if (!jFlag) fprintf(stderr, "Reading file %s\n", rvalue);
         size_t cycles = 0;
@@ -3579,7 +3756,6 @@ if (argc == 1) {
                 fflush(stderr);
             }
 
-            if (job)
             ReadFile02(&reference);
 
             possess(FreeWaiting);
@@ -3604,6 +3780,7 @@ if (argc == 1) {
                     }
                 }
             }
+
 
             addWork(job, false);
             cycles++;
@@ -3644,14 +3821,15 @@ if (argc == 1) {
 
 
     //Print out the stats for each reference file
-    file_id = 0;
-    while(optind_restore < argc)
+    for (size_t ri = 0; ri < ref_count; ri++)
     {
-        size_t_to_pretty(hitCounters[file_id * COUNTER_STRIDE], pretty, sizeof(pretty));
-        if (!jFlag) fprintf(stderr, "%s %s\n",argv[optind_restore],pretty);
-        optind_restore++;
-        file_id++;
+        size_t_to_pretty(hitCounters[ri * COUNTER_STRIDE], pretty, sizeof(pretty));
+        if (!jFlag) fprintf(stderr, "%s %s\n", ref_list[ri], pretty);
     }
+
+    for (size_t ri = 0; ri < ref_count; ri++)
+        free(ref_list[ri]);
+    free(ref_list);
 
     if (ovalue != NULL)
     {

@@ -132,7 +132,7 @@ void CountChunkV2(file_struct *file)
     // Check if the file has been read first
     if (file->buffer == NULL)
     {
-        fputs("File has not been read yet", stderr);
+        fprintf(stderr,"File has not been read yet\n");
         exit(3);
     }
 
@@ -461,7 +461,7 @@ int OpenFile02(file_struct *file)
     // Exit if file was 0 bytes
     if (file->f_size == 0)
     {
-        fprintf(stderr, "File is 0 bytes\n");
+        fprintf(stderr, "Warn: File is 0 bytes\n");
         return 0;
     }
 
@@ -484,7 +484,7 @@ size_t CountLines(file_struct *file)
         // Check if the file has been read first
         if (file->buffer == NULL)
         {
-            fputs("File has not been read yet", stderr);
+            fprintf(stderr,"File has not been read yet\n");
             exit(3);
         }
 
@@ -565,7 +565,7 @@ void IndexFile(file_struct *file)
     // Check if the file has been read first
     if (file->buffer == NULL)
     {
-        fputs("File has not been read yet", stderr);
+        fprintf(stderr,"File has not been read yet\n");
         exit(3);
     }
 
@@ -889,7 +889,7 @@ ReRead:
     result = fread(file->buffer, sizeof(char), readsize, file->f_pointer);
     if (result != readsize)
     {
-        printf("Readsize does not match %lld:\tPredicted %lld\tActual:\n", readsize, result);
+        fprintf(stderr,"Readsize does not match %lld:\tPredicted %lld\tActual:\n", readsize, result);
     }
 
     // Increment the number of bytes read
